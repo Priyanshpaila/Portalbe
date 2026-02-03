@@ -408,6 +408,7 @@ function pickAllowedItemMasterUpdates(body) {
     // base item fields
     "indentNumber", // Allow indentNumber to be updated
     "itemDescription",
+    "documentType",
     "techSpec",
     "make",
     "unitOfMeasure",

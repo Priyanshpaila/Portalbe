@@ -26,6 +26,7 @@ import preapprovedVendorRouter from "./routes/preapprovedVendor.router.js";
 import vendorRouter from "./routes/vendor.routes.js";
 import roleRouter from "./routes/role.routes.js";
 import appRouter from "./routes/app.routes.js";
+import indentTypeRouter from "./routes/indentType.router.js";
 
 // ❌ REMOVE side-effect imports (unsafe on every restart)
 // import "./lib/importIndents.js";
@@ -63,6 +64,7 @@ app.use("/api/po", authorizeTokens, poRouter);
 app.use("/api/user", authorizeTokens, userRouter);
 app.use("/api/role", authorizeTokens, roleRouter);
 app.use("/api/preapprovedVendor", preapprovedVendorRouter);
+app.use("/api/indent-type", indentTypeRouter)
 
 // ✅ uploads
 const uploads_dir = path.join(__dirname, "uploads");

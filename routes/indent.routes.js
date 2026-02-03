@@ -453,9 +453,15 @@ indentRouter.put("/add-item/:id", async (req, res, next) => {
     const idParam = String(req.params.id || "").trim();
     const now = new Date();
 
+    // ✅ allow :id to be either Mongo _id or your custom uuid "id"
+    const match = mongoose.isValidObjectId(idParam)
+      ? { _id: idParam }
+      : { id: idParam };
+
+    // 1) Pick normal editable fields
     const updates = pickAllowedItemMasterUpdates(req.body || {});
-    if (!Object.keys(updates).length) {
-      return res.status(400).json({ message: "No updatable fields provided" });
+    if (!updates || typeof updates !== "object") {
+      return res.status(400).json({ message: "Invalid payload" });
     }
 
     // ✅ protect critical fields (cannot be changed)
@@ -464,34 +470,74 @@ indentRouter.put("/add-item/:id", async (req, res, next) => {
     delete updates.documentCategory;
     delete updates.createdOn;
 
-    // ✅ keep qty fields untouched for ITEM_MASTER docs
-    delete updates.indentQty;
-    delete updates.preRFQQty;
-    delete updates.prePOQty;
-    delete updates.balanceQty;
-
     // cast date fields if sent as strings
     if (updates.documentDate)
       updates.documentDate = new Date(updates.documentDate);
     if (updates.utcTimestamp)
       updates.utcTimestamp = new Date(updates.utcTimestamp);
 
-    // ✅ allow :id to be either Mongo _id or your custom uuid "id"
-    const match = mongoose.isValidObjectId(idParam)
-      ? { _id: idParam }
-      : { id: idParam };
+    // 2) Extract qty fields (ALLOW NOW)
+    const qtyKeys = ["indentQty", "preRFQQty", "prePOQty"];
+    const qtyUpdates = {};
 
-    const doc = await indentModel.findOneAndUpdate(
-      { ...match, documentCategory: "ITEM_MASTER" }, // ✅ ONLY item-master docs
-      { $set: { ...updates, lastChangedOn: now } },
-      { new: true, runValidators: true },
-    );
+    for (const k of qtyKeys) {
+      if (
+        req.body?.[k] !== undefined &&
+        req.body?.[k] !== null &&
+        req.body?.[k] !== ""
+      ) {
+        const n = Number(req.body[k]);
+        if (!Number.isFinite(n) || n < 0) {
+          return res
+            .status(400)
+            .json({ message: `${k} must be a non-negative number` });
+        }
+        qtyUpdates[k] = n;
+      }
+    }
 
-    if (!doc) {
+    // ✅ If nothing to update at all
+    if (!Object.keys(updates).length && !Object.keys(qtyUpdates).length) {
+      return res.status(400).json({ message: "No updatable fields provided" });
+    }
+
+    // 3) Load current doc first (so we can compute balanceQty correctly)
+    const existing = await indentModel
+      .findOne({ ...match, documentCategory: "ITEM_MASTER" })
+      .lean();
+
+    if (!existing) {
       return res.status(404).json({
         message: "ITEM_MASTER item not found (or not created via /add-item)",
       });
     }
+
+    // 4) Compute the final qty values (new = provided else old)
+    const finalIndentQty =
+      qtyUpdates.indentQty ?? Number(existing.indentQty || 0);
+    const finalPreRFQQty =
+      qtyUpdates.preRFQQty ?? Number(existing.preRFQQty || 0);
+    const finalPrePOQty = qtyUpdates.prePOQty ?? Number(existing.prePOQty || 0);
+
+    // ✅ Server-truth balance (prevents mismatch)
+    const computedBalanceQty = Math.max(
+      0,
+      finalIndentQty - finalPreRFQQty - finalPrePOQty,
+    );
+
+    // 5) Build final update payload
+    const finalSet = {
+      ...updates,
+      ...qtyUpdates,
+      balanceQty: computedBalanceQty,
+      lastChangedOn: now,
+    };
+
+    const doc = await indentModel.findOneAndUpdate(
+      { ...match, documentCategory: "ITEM_MASTER" },
+      { $set: finalSet },
+      { new: true, runValidators: true },
+    );
 
     return res.status(200).json({ success: true, data: doc });
   } catch (err) {

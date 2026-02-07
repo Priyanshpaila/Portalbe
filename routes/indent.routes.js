@@ -2,6 +2,7 @@ import express from "express";
 import rfqModel from "../models/rfq.model.js";
 import poModel from "../models/po.model.js";
 import indentModel from "../models/indent.model.js";
+import counterModel from "../models/counter.model.js";
 import { importIndents } from "../lib/importIndents.js";
 import { syncIndentQuantity } from "../helpers/syncIndentQuantity.js";
 import { dataTable } from "../helpers/dataTable.js";
@@ -10,6 +11,122 @@ import mongoose from "mongoose";
 
 const indentRouter = express.Router();
 
+/** =========================
+ * ✅ AUTO CODE GENERATORS (Atomic counters)
+ * ========================= */
+function pad(num, len) {
+  return String(num).padStart(len, "0");
+}
+
+const COUNTERS = {
+  ITEM_CODE: { id: "itemCode", prefix: "IC", padLen: 8, field: "itemCode" },
+  INDENT_NO: { id: "indentNumber", prefix: "IN", padLen: 8, field: "indentNumber" },
+  LINE_NO: { id: "lineNumber", prefix: "", padLen: 5, field: "lineNumber" }, // numeric only
+};
+
+// cache init promises so init runs once per process
+const initMap = new Map();
+
+async function getMaxSeqFromCollection(cfg) {
+  const prefixLen = cfg.prefix.length;
+
+  // We compute numeric part using aggregation (more reliable than .sort() on strings).
+  const pipeline = [
+    {
+      $addFields: {
+        __val: { $toString: `$${cfg.field}` },
+      },
+    },
+    {
+      $match: cfg.prefix
+        ? { __val: { $regex: new RegExp(`^${cfg.prefix}\\d+$`) } }
+        : { __val: { $regex: new RegExp(`^\\d+$`) } },
+    },
+    {
+      $project: {
+        n: cfg.prefix
+          ? {
+              $toLong: {
+                $substrBytes: [
+                  "$__val",
+                  prefixLen,
+                  { $subtract: [{ $strLenBytes: "$__val" }, prefixLen] },
+                ],
+              },
+            }
+          : { $toLong: "$__val" },
+      },
+    },
+    { $group: { _id: null, maxN: { $max: "$n" } } },
+  ];
+
+  const res = await indentModel.aggregate(pipeline);
+  const maxN = res?.[0]?.maxN;
+  return Number.isFinite(maxN) ? Number(maxN) : 0;
+}
+
+async function ensureCounterInitialized(counterKey) {
+  if (initMap.has(counterKey)) return initMap.get(counterKey);
+
+  const cfg = COUNTERS[counterKey];
+
+  const p = (async () => {
+    const maxSeq = await getMaxSeqFromCollection(cfg);
+
+    // ✅ No conflict: only $max touches seq
+    await counterModel.findOneAndUpdate(
+      { _id: cfg.id },
+      { $max: { seq: maxSeq } },
+      { upsert: true, new: true }
+    );
+  })();
+
+  initMap.set(counterKey, p);
+  return p;
+}
+
+async function nextCode(counterKey) {
+  await ensureCounterInitialized(counterKey);
+  const cfg = COUNTERS[counterKey];
+
+  // ✅ No conflict: only $inc touches seq
+  const counter = await counterModel.findOneAndUpdate(
+    { _id: cfg.id },
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true }
+  );
+
+  const seq = Number(counter?.seq || 1);
+
+  if (cfg.prefix) return `${cfg.prefix}${pad(seq, cfg.padLen)}`;
+  return pad(seq, cfg.padLen);
+}
+
+async function currentCode(counterKey) {
+  await ensureCounterInitialized(counterKey);
+  const cfg = COUNTERS[counterKey];
+
+  const doc = await counterModel.findOne({ _id: cfg.id }).lean();
+  const seq = Number(doc?.seq || 0);
+
+  if (cfg.prefix) return `${cfg.prefix}${pad(seq, cfg.padLen)}`;
+  return pad(seq, cfg.padLen);
+}
+
+function normalizeIndentNumber(v) {
+  const raw = String(v ?? "").trim();
+  if (/^IN\d{8}$/.test(raw)) return raw;
+  return "";
+}
+function normalizeLineNumber(v) {
+  const raw = String(v ?? "").replace(/\D/g, "").slice(0, 5);
+  if (!raw) return "";
+  return pad(parseInt(raw, 10) || 0, 5);
+}
+
+/** =========================
+ *  Existing helpers
+ *  ========================= */
 const indentQuery = (filters) => {
   const query = {};
 
@@ -77,13 +194,16 @@ indentRouter.post("/list", async (req, res, next) => {
           : { balanceQty: { $gt: 0 } };
 
     const data = await indentModel.find(query).sort({ documentDate: -1 });
-
     res.status(200).send(data);
   } catch (error) {
     next(error);
   }
 });
 
+/**
+ * ✅ Your existing /register endpoint (unchanged)
+ * (kept exactly in structure; only depends on indentModel/rfqModel/poModel)
+ */
 indentRouter.post("/register", async (req, res, next) => {
   try {
     const { query, filters, ...params } = req.body;
@@ -91,39 +211,26 @@ indentRouter.post("/register", async (req, res, next) => {
     if (filters) {
       const filter = {};
       if (filters.status === "pending")
-        filter["$expr"] = {
-          $eq: ["$balanceQty", "$indentQty"],
-        };
+        filter["$expr"] = { $eq: ["$balanceQty", "$indentQty"] };
       else if (filters.status === "inProgress")
         filter["$expr"] = {
           $and: [
-            {
-              $lt: ["$balanceQty", "$indentQty"],
-            },
-            {
-              $gt: ["$balanceQty", 0],
-            },
+            { $lt: ["$balanceQty", "$indentQty"] },
+            { $gt: ["$balanceQty", 0] },
           ],
         };
       else if (filters.status === "completed") filter.balanceQty = 0;
-      // else if (filters.status === "expired") filter.status = 1
 
       if (filters.company?.length) filter.company = { $in: filters.company };
-      if (filters.indentNumber)
-        filter.indentNumber = filters.indentNumber.trim();
+      if (filters.indentNumber) filter.indentNumber = filters.indentNumber.trim();
       if (filters.itemCode) filter.itemCode = filters.itemCode.trim();
-      if (filters.itemDescription)
-        filter.itemDescription = filters.itemDescription.trim();
+      if (filters.itemDescription) filter.itemDescription = filters.itemDescription.trim();
       if (filters.documentDate?.[0]) {
         filter.documentDate = {};
         if (filters.documentDate[0])
-          filter.documentDate["$gte"] = new Date(
-            new Date(filters.documentDate[0]).setHours(0, 0, 0, 0),
-          );
+          filter.documentDate["$gte"] = new Date(new Date(filters.documentDate[0]).setHours(0, 0, 0, 0));
         if (filters.documentDate[1])
-          filter.documentDate["$lte"] = new Date(
-            new Date(filters.documentDate[1]).setHours(24, 0, 0, 0) - 1,
-          );
+          filter.documentDate["$lte"] = new Date(new Date(filters.documentDate[1]).setHours(24, 0, 0, 0) - 1);
       }
 
       if (Object.keys(filter).length) matchQuery.push({ $match: filter });
@@ -197,7 +304,7 @@ indentRouter.post("/register", async (req, res, next) => {
         sapPONumber: 1,
         refCSNumber: 1,
         refCSDate: 1,
-      },
+      }
     );
 
     const fields = {};
@@ -245,17 +352,12 @@ indentRouter.post("/register", async (req, res, next) => {
           const pos = poDetails[key]?.filter(
             (i) =>
               i.quotationNumber === csDetails.quotationNumber ||
-              i.csNumber === cs.csNumber,
+              i.csNumber === cs.csNumber
           );
 
           if (pos?.length > 0)
             for (const po of pos) {
-              const doc = {
-                ...data[key],
-                ...rfqDetails,
-                ...csDetails,
-                ...po,
-              };
+              const doc = { ...data[key], ...rfqDetails, ...csDetails, ...po };
               fields[key].push(doc);
             }
         };
@@ -279,15 +381,12 @@ indentRouter.post("/register", async (req, res, next) => {
 
         if (poDetails[key]?.length) {
           poDetails[key] = poDetails[key]?.filter(
-            (po) => !po.quotationNumber && !po.csNumber,
+            (po) => !po.quotationNumber && !po.csNumber
           );
           if (!poDetails[key]?.length) delete poDetails[key];
           else {
             for (const po of poDetails[key]) {
-              const doc = {
-                ...data[key],
-                ...po,
-              };
+              const doc = { ...data[key], ...po };
               fields[key].push(doc);
             }
           }
@@ -301,56 +400,70 @@ indentRouter.post("/register", async (req, res, next) => {
   }
 });
 
-// Add new item (auto-generate item code)
+/**
+ * ✅ Add new item (Backend ALWAYS generates itemCode, indentNumber, lineNumber)
+ * Frontend should NOT send them.
+ */
 indentRouter.post("/add-item", async (req, res, next) => {
   try {
-    const itemCode = req.body?.itemCode?.trim();
     const itemDescription = String(req.body?.itemDescription ?? "").trim();
     const techSpec = String(req.body?.techSpec ?? "").trim();
     const make = String(req.body?.make ?? "").trim();
-    const unitOfMeasure = String(
-      req.body?.unitOfMeasure ?? req.body?.unit ?? "",
-    ).trim();
+    const unitOfMeasure = String(req.body?.unitOfMeasure ?? req.body?.unit ?? "").trim();
 
-    const itemCodeToUse = itemCode; // Use generated or provided item code
-
-    if (!itemCodeToUse)
-      return res.status(400).json({ message: "itemCode is required" });
-    if (!itemDescription)
-      return res.status(400).json({ message: "itemDescription is required" });
-    if (!unitOfMeasure)
-      return res.status(400).json({ message: "unitOfMeasure is required" });
-
-    // Check if itemCode already exists
-    const exists = await indentModel.findOne({
-      documentCategory: "ITEM_MASTER",
-      itemCode: itemCodeToUse,
-    });
-
-    if (exists) {
-      return res.status(409).json({
-        message: "Item already exists for this itemCode",
-        data: exists,
-      });
-    }
+    if (!itemDescription) return res.status(400).json({ message: "itemDescription is required" });
+    if (!unitOfMeasure) return res.status(400).json({ message: "unitOfMeasure is required" });
 
     const now = new Date();
 
-    const created = await indentModel.create({
-      id: randomUUID(), // unique id in your schema
-      itemCode: itemCodeToUse,
-      itemDescription,
-      techSpec,
-      make,
-      unitOfMeasure,
-      documentCategory: "ITEM_MASTER",
-      createdOn: now,
-      lastChangedOn: now,
-      indentQty: 0,
-      preRFQQty: 0,
-      prePOQty: 0,
-      balanceQty: 0,
-    });
+    let created = null;
+
+    // retry safe (handles unique collisions on any of the 3 generated fields)
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const itemCodeToUse = await nextCode("ITEM_CODE");
+      const indentNumberToUse = await nextCode("INDENT_NO");
+      const lineNumberToUse = await nextCode("LINE_NO");
+
+      if (!itemCodeToUse) {
+        return res.status(500).json({ success: false, message: "Failed to generate itemCode" });
+      }
+
+      try {
+        created = await indentModel.create({
+          id: randomUUID(),
+          documentCategory: "ITEM_MASTER",
+
+          itemCode: itemCodeToUse,
+          indentNumber: indentNumberToUse,
+          lineNumber: lineNumberToUse,
+
+          itemDescription,
+          techSpec,
+          make,
+          unitOfMeasure,
+
+          createdOn: now,
+          lastChangedOn: now,
+
+          indentQty: 0,
+          preRFQQty: 0,
+          prePOQty: 0,
+          balanceQty: 0,
+        });
+
+        break;
+      } catch (e) {
+        if (e?.code === 11000) continue; // regenerate and retry
+        throw e;
+      }
+    }
+
+    if (!created) {
+      return res.status(500).json({
+        success: false,
+        message: "Failed to create item with unique auto-generated codes",
+      });
+    }
 
     return res.status(201).json({ success: true, data: created });
   } catch (err) {
@@ -364,7 +477,7 @@ indentRouter.get("/items", async (req, res, next) => {
     const page = Math.max(parseInt(String(req.query.page ?? "1"), 10) || 1, 1);
     const pageSize = Math.min(
       Math.max(parseInt(String(req.query.pageSize ?? "50"), 10) || 50, 1),
-      200,
+      200
     );
 
     const filter = { documentCategory: "ITEM_MASTER" };
@@ -405,24 +518,24 @@ indentRouter.get("/items", async (req, res, next) => {
 
 function pickAllowedItemMasterUpdates(body) {
   const allowed = [
-    // base item fields
-    "indentNumber", // Allow indentNumber to be updated
+    // allow these (optional)
+    "indentNumber",
+    "lineNumber",
+
     "itemDescription",
     "documentType",
     "techSpec",
     "make",
     "unitOfMeasure",
-    // "other fields" from your indent schema (safe metadata)
+
     "company",
     "costCenter",
     "remark",
-    "unitOfMeasure",
     "materialNumber",
     "storageLocation",
     "trackingNumber",
     "documentNumber",
     "documentDate",
-    "lineNumber",
     "requestedBy",
     "createdBy",
     "deletionIndicator",
@@ -438,7 +551,6 @@ function pickAllowedItemMasterUpdates(body) {
     if (Object.prototype.hasOwnProperty.call(body, k)) out[k] = body[k];
   }
 
-  // normalize "unit" -> unitOfMeasure
   if (
     Object.prototype.hasOwnProperty.call(body, "unit") &&
     !Object.prototype.hasOwnProperty.call(out, "unitOfMeasure")
@@ -449,60 +561,61 @@ function pickAllowedItemMasterUpdates(body) {
   return out;
 }
 
+/**
+ * ✅ Update ITEM_MASTER
+ * - If indentNumber/lineNumber is included but blank/invalid => backend generates.
+ * - If not included => keep existing.
+ */
 indentRouter.put("/add-item/:id", async (req, res, next) => {
   try {
     const idParam = String(req.params.id || "").trim();
     const now = new Date();
 
-    // ✅ allow :id to be either Mongo _id or your custom uuid "id"
     const match = mongoose.isValidObjectId(idParam)
       ? { _id: idParam }
       : { id: idParam };
 
-    // 1) Pick normal editable fields
     const updates = pickAllowedItemMasterUpdates(req.body || {});
     if (!updates || typeof updates !== "object") {
       return res.status(400).json({ message: "Invalid payload" });
     }
 
-    // ✅ protect critical fields (cannot be changed)
     delete updates._id;
     delete updates.id;
     delete updates.documentCategory;
     delete updates.createdOn;
 
-    // cast date fields if sent as strings
-    if (updates.documentDate)
-      updates.documentDate = new Date(updates.documentDate);
-    if (updates.utcTimestamp)
-      updates.utcTimestamp = new Date(updates.utcTimestamp);
+    if (updates.documentDate) updates.documentDate = new Date(updates.documentDate);
+    if (updates.utcTimestamp) updates.utcTimestamp = new Date(updates.utcTimestamp);
 
-    // 2) Extract qty fields (ALLOW NOW)
+    // if client explicitly sent indentNumber/lineNumber, normalize or auto-generate
+    if (Object.prototype.hasOwnProperty.call(updates, "indentNumber")) {
+      const v = normalizeIndentNumber(updates.indentNumber);
+      updates.indentNumber = v || (await nextCode("INDENT_NO"));
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, "lineNumber")) {
+      const v = normalizeLineNumber(updates.lineNumber);
+      updates.lineNumber = v || (await nextCode("LINE_NO"));
+    }
+
+    // qty updates
     const qtyKeys = ["indentQty", "preRFQQty", "prePOQty"];
     const qtyUpdates = {};
 
     for (const k of qtyKeys) {
-      if (
-        req.body?.[k] !== undefined &&
-        req.body?.[k] !== null &&
-        req.body?.[k] !== ""
-      ) {
+      if (req.body?.[k] !== undefined && req.body?.[k] !== null && req.body?.[k] !== "") {
         const n = Number(req.body[k]);
         if (!Number.isFinite(n) || n < 0) {
-          return res
-            .status(400)
-            .json({ message: `${k} must be a non-negative number` });
+          return res.status(400).json({ message: `${k} must be a non-negative number` });
         }
         qtyUpdates[k] = n;
       }
     }
 
-    // ✅ If nothing to update at all
     if (!Object.keys(updates).length && !Object.keys(qtyUpdates).length) {
       return res.status(400).json({ message: "No updatable fields provided" });
     }
 
-    // 3) Load current doc first (so we can compute balanceQty correctly)
     const existing = await indentModel
       .findOne({ ...match, documentCategory: "ITEM_MASTER" })
       .lean();
@@ -513,20 +626,12 @@ indentRouter.put("/add-item/:id", async (req, res, next) => {
       });
     }
 
-    // 4) Compute the final qty values (new = provided else old)
-    const finalIndentQty =
-      qtyUpdates.indentQty ?? Number(existing.indentQty || 0);
-    const finalPreRFQQty =
-      qtyUpdates.preRFQQty ?? Number(existing.preRFQQty || 0);
+    const finalIndentQty = qtyUpdates.indentQty ?? Number(existing.indentQty || 0);
+    const finalPreRFQQty = qtyUpdates.preRFQQty ?? Number(existing.preRFQQty || 0);
     const finalPrePOQty = qtyUpdates.prePOQty ?? Number(existing.prePOQty || 0);
 
-    // ✅ Server-truth balance (prevents mismatch)
-    const computedBalanceQty = Math.max(
-      0,
-      finalIndentQty - finalPreRFQQty - finalPrePOQty,
-    );
+    const computedBalanceQty = Math.max(0, finalIndentQty - finalPreRFQQty - finalPrePOQty);
 
-    // 5) Build final update payload
     const finalSet = {
       ...updates,
       ...qtyUpdates,
@@ -537,7 +642,7 @@ indentRouter.put("/add-item/:id", async (req, res, next) => {
     const doc = await indentModel.findOneAndUpdate(
       { ...match, documentCategory: "ITEM_MASTER" },
       { $set: finalSet },
-      { new: true, runValidators: true },
+      { new: true, runValidators: true }
     );
 
     return res.status(200).json({ success: true, data: doc });
@@ -546,69 +651,33 @@ indentRouter.put("/add-item/:id", async (req, res, next) => {
   }
 });
 
-// Endpoint to fetch the last used item code
+/** -------------------------
+ * Compatibility endpoints (optional but useful)
+ * ------------------------- */
 indentRouter.get("/last-item-code", async (req, res, next) => {
   try {
-    // Find the latest item code (sort by itemCode in descending order)
-    const lastItem = await indentModel
-      .findOne({ documentCategory: "ITEM_MASTER" })
-      .sort({ itemCode: -1 })
-      .select("itemCode"); // Only return itemCode
-
-    if (!lastItem) {
-      // If no item is found, start from the initial code
-      return res.status(200).json({ lastItemCode: "IC00000000" });
-    }
-
-    const lastCode = lastItem.itemCode;
-
-    return res.status(200).json({ lastItemCode: lastCode });
-  } catch (error) {
-    next(error);
+    const lastItemCode = await currentCode("ITEM_CODE"); // last used
+    return res.status(200).json({ lastItemCode: lastItemCode || "IC00000000" });
+  } catch (e) {
+    next(e);
   }
 });
 
-// Endpoint to fetch the last used indent number
 indentRouter.get("/last-indent-number", async (req, res, next) => {
   try {
-    // Find the latest indent number (sort by itemCode in descending order)
-    const lastItem = await indentModel
-      .findOne({ documentCategory: "ITEM_MASTER" })
-      .sort({ indentNumber: -1 })
-      .select("indentNumber"); // Only return indentNumber
-
-    if (!lastItem) {
-      // If no item is found, start from the initial code
-      return res.status(200).json({ lastindentNumber: "IN00000000" });
-    }
-
-    const lastCode = lastItem.indentNumber;
-
-    return res.status(200).json({ lastindentNumber: lastCode });
-  } catch (error) {
-    next(error);
+    const lastindentNumber = await currentCode("INDENT_NO");
+    return res.status(200).json({ lastindentNumber: lastindentNumber || "IN00000000" });
+  } catch (e) {
+    next(e);
   }
 });
 
-// Endpoint to fetch the last used line number
 indentRouter.get("/last-line-number", async (req, res, next) => {
   try {
-    // Find the latest line number (sort by itemCode in descending order)
-    const lastItem = await indentModel
-      .findOne({ documentCategory: "ITEM_MASTER" })
-      .sort({ lineNumber: -1 })
-      .select("lineNumber"); // Only return lineNumber
-
-    if (!lastItem) {
-      // If no item is found, start from the initial code
-      return res.status(200).json({ lastlineNumber: "00000" });
-    }
-
-    const lastCode = lastItem.lineNumber;
-
-    return res.status(200).json({ lastlineNumber: lastCode });
-  } catch (error) {
-    next(error);
+    const lastlineNumber = await currentCode("LINE_NO");
+    return res.status(200).json({ lastlineNumber: lastlineNumber || "00000" });
+  } catch (e) {
+    next(e);
   }
 });
 

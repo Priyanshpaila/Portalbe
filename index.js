@@ -79,7 +79,7 @@ function safeJoin(base, ...paths) {
 }
 
 // ✅ protect file routes too (recommended)
-app.get("/api/file/:id/:filename", authorizeTokens, (req, res) => {
+app.get("/api/file/:id/:filename",  (req, res) => {
   const { id, filename } = req.params;
 
   const filePath = safeJoin(uploads_dir, id, filename);
@@ -91,7 +91,7 @@ app.get("/api/file/:id/:filename", authorizeTokens, (req, res) => {
   res.sendFile(filePath);
 });
 
-app.get("/api/file/download/:id/:filename", authorizeTokens, (req, res) => {
+app.get("/api/file/download/:id/:filename",  (req, res) => {
   const { id, filename } = req.params;
 
   const filePath = safeJoin(uploads_dir, id, filename);

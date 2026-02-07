@@ -19,7 +19,7 @@ authRouter.post("/login", async (req, res, next) => {
 			if (!isMatch) throw createError("Invalid username or password", 401)
 		}
 
-		const role = await roleModel.findById(user.role, { permissions: 1 })
+		const role = await roleModel.findById(user.role, { permissions: 1, name: 1 })
 		if (!role) throw createError("User assigned invalid role", 401)
 
 		const token = jwt.sign(
@@ -40,7 +40,8 @@ authRouter.post("/login", async (req, res, next) => {
 			user: {
 				...user,
 				permissions: role.permissions
-			}
+			},
+			role: role.name,
 		})
 	} catch (error) {
 		next(error)

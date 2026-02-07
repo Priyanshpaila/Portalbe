@@ -8,63 +8,121 @@ const preapprovedVendorRouter = express.Router();
 /** =========================
  *  vendorCode generator (VND0001...)
  *  ========================= */
-const COUNTER_ID = "vendorCode";
+const VENDOR_COUNTER_ID = "vendorCode";
 const VENDOR_PREFIX = "VND";
-const PAD_LEN = 4;
+const VENDOR_PAD_LEN = 4;
+
+/** =========================
+ *  companyCode generator (CN00001...)
+ *  ========================= */
+const COMPANY_COUNTER_ID = "companyCode";
+const COMPANY_PREFIX = "CN";
+const COMPANY_PAD_LEN = 5;
 
 function pad(num, len) {
   return String(num).padStart(len, "0");
 }
 
-function parseSeqFromVendorCode(code) {
+function parseSeq(code, prefix) {
   if (!code || typeof code !== "string") return 0;
-  if (!code.startsWith(VENDOR_PREFIX)) return 0;
-  const n = parseInt(code.slice(VENDOR_PREFIX.length), 10);
+  if (!code.startsWith(prefix)) return 0;
+  const n = parseInt(code.slice(prefix.length), 10);
   return Number.isFinite(n) ? n : 0;
 }
 
-let initPromise = null;
+let initVendorPromise = null;
+let initCompanyPromise = null;
 
 async function ensureVendorCounterInitialized() {
-  if (initPromise) return initPromise;
+  if (initVendorPromise) return initVendorPromise;
 
-  initPromise = (async () => {
+  initVendorPromise = (async () => {
     const maxDoc = await vendorModel
       .findOne({ vendorCode: new RegExp(`^${VENDOR_PREFIX}\\d+$`) })
       .sort({ vendorCode: -1 })
       .select({ vendorCode: 1 })
       .lean();
 
-    const maxSeq = maxDoc ? parseSeqFromVendorCode(maxDoc.vendorCode) : 0;
+    const maxSeq = maxDoc ? parseSeq(maxDoc.vendorCode, VENDOR_PREFIX) : 0;
 
     await counterModel.findByIdAndUpdate(
-      COUNTER_ID,
+      VENDOR_COUNTER_ID,
       { $max: { seq: maxSeq } },
       { upsert: true, new: true }
     );
   })();
 
-  return initPromise;
+  return initVendorPromise;
 }
 
 async function nextVendorCode() {
   await ensureVendorCounterInitialized();
 
   const counter = await counterModel.findByIdAndUpdate(
-    COUNTER_ID,
+    VENDOR_COUNTER_ID,
     { $inc: { seq: 1 } },
     { new: true, upsert: true }
   );
 
   const seq = counter?.seq || 1;
-  return `${VENDOR_PREFIX}${pad(seq, PAD_LEN)}`;
+  return `${VENDOR_PREFIX}${pad(seq, VENDOR_PAD_LEN)}`;
+}
+
+/**
+ * Company counter init should consider BOTH collections
+ * (because companyCode exists in preapproved + vendor master)
+ */
+async function ensureCompanyCounterInitialized() {
+  if (initCompanyPromise) return initCompanyPromise;
+
+  initCompanyPromise = (async () => {
+    const regex = new RegExp(`^${COMPANY_PREFIX}\\d+$`);
+
+    const [maxVendor, maxPre] = await Promise.all([
+      vendorModel
+        .findOne({ companyCode: regex })
+        .sort({ companyCode: -1 })
+        .select({ companyCode: 1 })
+        .lean(),
+      preapprovedVendorModel
+        .findOne({ companyCode: regex })
+        .sort({ companyCode: -1 })
+        .select({ companyCode: 1 })
+        .lean(),
+    ]);
+
+    const maxSeqVendor = maxVendor ? parseSeq(maxVendor.companyCode, COMPANY_PREFIX) : 0;
+    const maxSeqPre = maxPre ? parseSeq(maxPre.companyCode, COMPANY_PREFIX) : 0;
+    const maxSeq = Math.max(maxSeqVendor, maxSeqPre);
+
+    await counterModel.findByIdAndUpdate(
+      COMPANY_COUNTER_ID,
+      { $max: { seq: maxSeq } },
+      { upsert: true, new: true }
+    );
+  })();
+
+  return initCompanyPromise;
+}
+
+async function nextCompanyCode() {
+  await ensureCompanyCounterInitialized();
+
+  const counter = await counterModel.findByIdAndUpdate(
+    COMPANY_COUNTER_ID,
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true }
+  );
+
+  const seq = counter?.seq || 1;
+  return `${COMPANY_PREFIX}${pad(seq, COMPANY_PAD_LEN)}`;
 }
 
 /** =========================
  *  Routes
  *  ========================= */
 
-// ✅ Create preapproved vendor (pending by default)
+// ✅ Create preapproved vendor (pending by default) + auto companyCode (CN00001...)
 preapprovedVendorRouter.post("/", async (req, res, next) => {
   try {
     const payload = req.body || {};
@@ -74,12 +132,40 @@ preapprovedVendorRouter.post("/", async (req, res, next) => {
       return res.status(400).send({ success: false, message: "name is required" });
     }
 
-    const created = await preapprovedVendorModel.create({
-      ...payload,
-      name,
-      status: "pending",
-      contactPerson: Array.isArray(payload.contactPerson) ? payload.contactPerson : [],
-    });
+    // ✅ always auto-generate companyCode if not provided
+    // (recommended: do not trust client for sequential codes)
+    let companyCode = String(payload.companyCode || "").trim();
+    if (!companyCode) {
+      companyCode = await nextCompanyCode();
+    }
+
+    // ✅ handle unique collision just like vendorCode (rare but safe)
+    let created = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        created = await preapprovedVendorModel.create({
+          ...payload,
+          name,
+          companyCode,
+          status: "pending",
+          contactPerson: Array.isArray(payload.contactPerson) ? payload.contactPerson : [],
+        });
+        break;
+      } catch (e) {
+        if (e?.code === 11000) {
+          companyCode = await nextCompanyCode();
+          continue;
+        }
+        throw e;
+      }
+    }
+
+    if (!created) {
+      return res.status(500).send({
+        success: false,
+        message: "Failed to create preapproved vendor with unique companyCode",
+      });
+    }
 
     res.status(201).send({ success: true, data: created });
   } catch (err) {
@@ -101,6 +187,7 @@ preapprovedVendorRouter.get("/list", async (req, res, next) => {
         { name: { $regex: s, $options: "i" } },
         { gstin: { $regex: s, $options: "i" } },
         { panNumber: { $regex: s, $options: "i" } },
+        { companyCode: { $regex: s, $options: "i" } },
       ];
     }
 
@@ -119,6 +206,9 @@ preapprovedVendorRouter.put("/:id", async (req, res, next) => {
 
     // Don't allow status to be changed here
     if (payload.status) delete payload.status;
+
+    // OPTIONAL: block editing companyCode (recommended)
+    if (payload.companyCode) delete payload.companyCode;
 
     const updated = await preapprovedVendorModel.findOneAndUpdate(
       { _id: id, status: "pending" },
@@ -144,7 +234,6 @@ preapprovedVendorRouter.post("/:id/approve", async (req, res, next) => {
   try {
     const id = req.params.id;
 
-    // fetch doc
     const pre = await preapprovedVendorModel.findById(id);
     if (!pre) return res.status(404).send({ success: false, message: "Preapproved vendor not found" });
 
@@ -152,7 +241,12 @@ preapprovedVendorRouter.post("/:id/approve", async (req, res, next) => {
       return res.status(400).send({ success: false, message: "Already approved" });
     }
 
-    // prepare vendor payload (remove status + mongo fields)
+    // ✅ fallback: if somehow companyCode missing, generate now
+    if (!String(pre.companyCode || "").trim()) {
+      pre.companyCode = await nextCompanyCode();
+      await pre.save();
+    }
+
     const obj = pre.toObject();
     delete obj._id;
     delete obj.__v;
@@ -160,7 +254,6 @@ preapprovedVendorRouter.post("/:id/approve", async (req, res, next) => {
     delete obj.createdAt;
     delete obj.updatedAt;
 
-    // create in main vendor with auto vendorCode
     let createdVendor = null;
 
     for (let attempt = 0; attempt < 5; attempt++) {
@@ -169,10 +262,10 @@ preapprovedVendorRouter.post("/:id/approve", async (req, res, next) => {
         createdVendor = await vendorModel.create({
           ...obj,
           vendorCode, // ✅ auto generated here
+          companyCode: obj.companyCode, // ✅ keep same company code
         });
         break;
       } catch (e) {
-        // if somehow collision happens, try next
         if (e?.code === 11000) continue;
         throw e;
       }
@@ -185,7 +278,6 @@ preapprovedVendorRouter.post("/:id/approve", async (req, res, next) => {
       });
     }
 
-    // mark preapproved as approved
     pre.status = "approved";
     await pre.save();
 

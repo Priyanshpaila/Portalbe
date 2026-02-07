@@ -30,7 +30,7 @@ const preapprovedVendorSchema = new Schema(
     gstin: { type: String },
     orgName1: { type: String },
     orgName2: { type: String },
-    companyCode: { type: String },
+    companyCode: { type: String, unique: true, index: true },
     cityPostalCode: { type: String },
     street: { type: String },
     street2: { type: String },

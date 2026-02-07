@@ -235,4 +235,55 @@ userRouter.post("/reset-password", async (req, res, next) => {
 	}
 })
 
+// ✅ Admin gets all users, others get only self
+userRouter.get("/me-or-all", async (req, res, next) => {
+  try {
+    // 1) Load logged-in user with role populated
+    const me = await User.findById(req.user._id).populate("role", "name");
+    if (!me) throw createError("User not found", 404);
+
+    const roleName = String(me?.role?.name || "").toLowerCase();
+    const isAdmin = roleName === "admin"; // ✅ if your role name differs, adjust this check
+
+    // 2) If not admin: return only self (without password)
+    if (!isAdmin) {
+      const self = await User.findById(req.user._id, { password: 0 }).populate("role", "name");
+      return res.status(200).json([self]); // return array for same shape as admin response
+    }
+
+    // 3) Admin: return all users with details (same as your GET "/")
+    const users = await User.aggregate([
+      {
+        $lookup: {
+          from: "roles",
+          localField: "role",
+          foreignField: "_id",
+          pipeline: [{ $project: { name: 1 } }],
+          as: "role",
+        },
+      },
+      {
+        $lookup: {
+          from: "users",
+          localField: "createdBy",
+          foreignField: "_id",
+          pipeline: [{ $project: { name: 1 } }],
+          as: "createdBy",
+        },
+      },
+      {
+        $set: {
+          role: { $first: "$role.name" },
+          createdBy: { $first: "$createdBy.name" },
+        },
+      },
+      { $unset: "password" },
+    ]);
+
+    return res.status(200).json(users);
+  } catch (error) {
+    next(error);
+  }
+});
+
 export default userRouter

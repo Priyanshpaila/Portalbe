@@ -27,6 +27,8 @@ import vendorRouter from "./routes/vendor.routes.js";
 import roleRouter from "./routes/role.routes.js";
 import appRouter from "./routes/app.routes.js";
 import indentTypeRouter from "./routes/indentType.router.js";
+import billingRouter from "./routes/billing.routes.js";
+import { subscriptionGuard } from "./middlewares/subscription.middleware.js";
 
 // ❌ REMOVE side-effect imports (unsafe on every restart)
 // import "./lib/importIndents.js";
@@ -47,24 +49,37 @@ app.use(
     credentials: true,
   })
 );
-app.use(express.json({ limit: "10mb" }));
+app.use(
+  express.json({
+    limit: "10mb",
+    verify: (req, res, buf) => {
+      // IMPORTANT: store raw body ONLY for Razorpay webhook verification
+      if (req.originalUrl?.startsWith("/api/billing/webhook/razorpay")) {
+        req.rawBody = buf;
+      }
+    },
+  })
+);
 app.use(express.urlencoded({ extended: true }));
 
 // ✅ routes
 app.use("/api/auth", authRouter);
+app.use("/api/billing", billingRouter);
 
-app.use("/api/indent", authorizeTokens, indentRouter);
-app.use("/api/app", authorizeTokens, appRouter);
-app.use("/api/vendor", authorizeTokens, vendorRouter);
-app.use("/api/rfq", authorizeTokens, rfqRouter);
-app.use("/api/negotiation", authorizeTokens, negotiationRouter);
-app.use("/api/quotation", authorizeTokens, quotationRouter);
-app.use("/api/cs", authorizeTokens, csRouter);
-app.use("/api/po", authorizeTokens, poRouter);
-app.use("/api/user", authorizeTokens, userRouter);
-app.use("/api/role", authorizeTokens, roleRouter);
-app.use("/api/preapprovedVendor", preapprovedVendorRouter);
-app.use("/api/indent-type", indentTypeRouter)
+const protectedApi = [authorizeTokens, subscriptionGuard()];
+
+app.use("/api/indent", ...protectedApi, indentRouter);
+app.use("/api/app", ...protectedApi, appRouter);
+app.use("/api/vendor", ...protectedApi, vendorRouter);
+app.use("/api/rfq", ...protectedApi, rfqRouter);
+app.use("/api/negotiation", ...protectedApi, negotiationRouter);
+app.use("/api/quotation", ...protectedApi, quotationRouter);
+app.use("/api/cs", ...protectedApi, csRouter);
+app.use("/api/po", ...protectedApi, poRouter);
+app.use("/api/user", ...protectedApi, userRouter);
+app.use("/api/role", ...protectedApi, roleRouter);
+app.use("/api/preapprovedVendor", ...protectedApi, preapprovedVendorRouter);
+app.use("/api/indent-type", ...protectedApi, indentTypeRouter);
 
 // ✅ uploads
 const uploads_dir = path.join(__dirname, "uploads");

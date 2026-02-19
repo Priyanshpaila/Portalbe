@@ -29,6 +29,7 @@ import appRouter from "./routes/app.routes.js";
 import indentTypeRouter from "./routes/indentType.router.js";
 import billingRouter from "./routes/billing.routes.js";
 import { subscriptionGuard } from "./middlewares/subscription.middleware.js";
+import connectionsRouter from "./routes/connections.routes.js";
 
 // ❌ REMOVE side-effect imports (unsafe on every restart)
 // import "./lib/importIndents.js";
@@ -80,6 +81,8 @@ app.use("/api/user", ...protectedApi, userRouter);
 app.use("/api/role", ...protectedApi, roleRouter);
 app.use("/api/preapprovedVendor", ...protectedApi, preapprovedVendorRouter);
 app.use("/api/indent-type", ...protectedApi, indentTypeRouter);
+app.use("/api/connections", ...protectedApi, connectionsRouter);
+
 
 // ✅ uploads
 const uploads_dir = path.join(__dirname, "uploads");

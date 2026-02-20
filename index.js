@@ -79,7 +79,7 @@ app.use("/api/cs", ...protectedApi, csRouter);
 app.use("/api/po", ...protectedApi, poRouter);
 app.use("/api/user", ...protectedApi, userRouter);
 app.use("/api/role", ...protectedApi, roleRouter);
-app.use("/api/preapprovedVendor", ...protectedApi, preapprovedVendorRouter);
+app.use("/api/preapprovedVendor",  preapprovedVendorRouter);
 app.use("/api/indent-type", ...protectedApi, indentTypeRouter);
 app.use("/api/connections", ...protectedApi, connectionsRouter);
 

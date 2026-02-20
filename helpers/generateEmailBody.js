@@ -7,15 +7,18 @@ function safeDateText(d) {
 function rfq(dueDate, vendorId) {
   return `Dear Authority,
 
+A new enquiry has been submitted on our portal. Kindly log in to the vendor portal and submit your quotation for the mentioned item(s).
 
+Quotation submission deadline: ${safeDateText(dueDate)}
 
-We would like to inform you that new enquiry has been submitted in our portal. Kindly provide quotation for mention item by login in to our vendor portal.
+Login link (My Account):
+${process.env.FRONTEND_URL}/login/${vendorId}?redirectUrl=/rfqs
 
-Last date of quotation submission is ${safeDateText(dueDate)}.
+If the link does not open, please copy and paste it into your browser.
 
-Please click on the below link to login to My Account:
-
-${process.env.FRONTEND_URL}/login/${vendorId}?redirectUrl=/rfqs`;
+Regards,
+Procurement Team
+(Note: This is an automated message. Please do not reply to this email.)`;
 }
 
 function po(poNumber, poDate, userId) {
@@ -25,24 +28,35 @@ function po(poNumber, poDate, userId) {
 
   return `Dear Authority,
 
-
-
-SAP No. Portal PO No. ${poNumber}, Dated - ${safeDateText(
+SAP No. / Portal PO No. ${poNumber}, dated ${safeDateText(
     poDate
-  )} has been created. It is pending for your approval.
+  )}, has been created and is pending for your approval.
 
-For more detail login at:
+Please log in to review and approve the PO:
+${process.env.FRONTEND_URL}/${path}
 
-${process.env.FRONTEND_URL}/${path}`;
+If the link does not open, please copy and paste it into your browser.
+
+Regards,
+Procurement Team
+(Note: This is an automated message. Please do not reply to this email.)`;
 }
 
 function negotiation(quotationNumber, vendorId) {
-  return `Negotiation request for Quotation No : ${quotationNumber} has been submitted.
-Please click on the below link to login to My Account:
+  return `Dear Vendor,
 
+A negotiation request has been initiated for Quotation No: ${quotationNumber}.
+
+Please log in to your account to review and respond:
 ${process.env.FRONTEND_URL}/login/${vendorId}?redirectUrl=${encodeURIComponent(
     `/quotation?quotationNumber=${quotationNumber}`
   )}
+
+If the link does not open, please copy and paste it into your browser.
+
+Regards,
+Procurement Team
+(Note: This is an automated message. Please do not reply to this email.)
 `;
 }
 

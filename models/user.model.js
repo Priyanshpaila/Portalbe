@@ -1,11 +1,77 @@
+import mongoose from "mongoose";
 
-import { Schema, Types, model } from "mongoose";
+const { Schema, Types, model } = mongoose;
+
+/* ---------------- Vendor sub-schema (same fields as your vendor model) ---------------- */
+
+const VendorContactPersonSchema = new Schema(
+  {
+    name: { type: String, default: "" },
+    email: { type: String, default: "" },
+    mobilePhoneIndicator: { type: String, default: "" },
+    fullPhoneNumber: { type: String, default: "" },
+    callerPhoneNumber: { type: String, default: "" },
+  },
+  { _id: false },
+);
+
+const VendorProfileSchema = new Schema(
+  {
+    // keep vendorCode also inside profile for completeness (root vendorCode is still the source of truth)
+    vendorCode: { type: String, default: null },
+
+    countryKey: { type: String, default: "" },
+    name: { type: String, default: "" },
+
+    name1: { type: String, default: "" },
+    name2: { type: String, default: "" },
+    name3: { type: String, default: "" },
+    name4: { type: String, default: "" },
+
+    city: { type: String, default: "" },
+    district: { type: String, default: "" },
+
+    poBox: { type: String, default: "" },
+    poBoxPostalCode: { type: String, default: "" },
+    postalCode: { type: String, default: "" },
+
+    creationDate: { type: String, default: "" },
+    sortField: { type: String, default: "" },
+
+    streetHouseNumber: { type: String, default: "" },
+
+    panNumber: { type: String, default: "" },
+    msme: { type: String, default: "" },
+    gstin: { type: String, default: "" },
+
+    orgName1: { type: String, default: "" },
+    orgName2: { type: String, default: "" },
+
+    companyCode: { type: String, default: "" },
+
+    cityPostalCode: { type: String, default: "" },
+
+    street: { type: String, default: "" },
+    street2: { type: String, default: "" },
+    street3: { type: String, default: "" },
+    street4: { type: String, default: "" },
+    street5: { type: String, default: "" },
+
+    languageKey: { type: String, default: "" },
+    region: { type: String, default: "" },
+
+    contactPerson: { type: [VendorContactPersonSchema], default: [] },
+  },
+  { _id: false },
+);
+
+/* ---------------- Main users schema (firm + vendor in same collection) ---------------- */
 
 const userSchema = new Schema(
   {
     /**
-     * ✅ If vendorCode exists => this user is a VENDOR account.
-     * ✅ If vendorCode does NOT exist => this user is a FIRM account OR a firm-employee (depends on firmId)
+     * ✅ If vendorCode exists => VENDOR account
+     * ✅ If vendorCode does NOT exist => FIRM root or firm employee (depends on firmId)
      */
     vendorCode: { type: String, trim: true, default: null, index: true },
 
@@ -20,7 +86,6 @@ const userSchema = new Schema(
     email: { type: String, trim: true, lowercase: true, default: "" },
 
     username: { type: String, required: true, unique: true, trim: true },
-
     password: { type: String, required: true },
 
     passwordStatus: {
@@ -32,6 +97,10 @@ const userSchema = new Schema(
 
     createdBy: { type: Types.ObjectId, ref: "users", default: null },
 
+    /**
+     * ✅ Keep your existing display name (required)
+     * - For vendors you can set this = vendorProfile.name OR name1/orgName1 etc.
+     */
     name: { type: String, required: true, trim: true },
 
     role: { type: Types.ObjectId, ref: "roles", default: null },
@@ -39,7 +108,6 @@ const userSchema = new Schema(
     /**
      * ✅ Firm company details
      * - required ONLY for firm ROOT users (not vendor, not firm employee)
-     * - safe defaults so missing frontend fields won't crash
      */
     company: {
       name: {
@@ -51,12 +119,10 @@ const userSchema = new Schema(
             this.vendorCode && String(this.vendorCode).trim()
           );
           const isFirmEmployee = !!this.firmId;
-          // ✅ Require company.name only for firm ROOT account
           return !isVendor && !isFirmEmployee;
         },
       },
 
-      // ✅ Make ONE field filterable on frontend (industry)
       industry: { type: String, trim: true, default: "", index: true },
 
       gstin: { type: String, trim: true, uppercase: true, default: "" },
@@ -73,12 +139,13 @@ const userSchema = new Schema(
     },
 
     /**
-     * ✅ “Friends-like” vendor <-> firm association
-     * - We keep it inside user so you can filter vendors visible to firm, etc.
-     * - Keeps your existing vendorModel unchanged.
-     *
-     * firmVendorLinks: only meaningful for firm users (vendorCode empty)
-     * vendorFirmLinks: only meaningful for vendor users (vendorCode present)
+     * ✅ Vendor fields (all fields from vendor schema)
+     * - Only meaningful when vendorCode is present
+     */
+    vendorProfile: { type: VendorProfileSchema, default: {} },
+
+    /**
+     * ✅ Friend-like vendor<->firm association (your existing structure)
      */
     firmVendorLinks: [
       {
@@ -88,8 +155,7 @@ const userSchema = new Schema(
           enum: ["pending", "active", "blocked", "removed"],
           default: "pending",
           index: true,
-        }, 
-        // ✅ tie link validity to subscription
+        },
         activeUntil: { type: Date, default: null },
         createdAt: { type: Date, default: Date.now },
       },
@@ -113,41 +179,55 @@ const userSchema = new Schema(
   },
   {
     timestamps: { createdAt: true, updatedAt: false },
-    minimize: false, // ✅ keep empty objects; safer for company defaults
+    minimize: false,
   },
 );
 
-/** =========================
- * ✅ Indexes (safe + non-crashing)
- * ========================= */
+/* ---------------- Indexes ---------------- */
 
-// common queries
-userSchema.index({ vendorCode: 1 }, { sparse: true });
+// ✅ vendorCode must be unique ONLY when it is a real string (prevents "null duplicates" breaking)
+userSchema.index(
+  { vendorCode: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { vendorCode: { $type: "string", $ne: "" } },
+  },
+);
+
 userSchema.index({ firmId: 1 }, { sparse: true });
 
-// filtering firms by industry/name
+// firm filtering
 userSchema.index({ "company.industry": 1 }, { sparse: true });
 userSchema.index({ "company.name": 1 }, { sparse: true });
 
-// unique GSTIN for firms only (optional, safe)
+// vendor filtering / searches
+userSchema.index({ "vendorProfile.gstin": 1 }, { sparse: true });
+userSchema.index({ "vendorProfile.panNumber": 1 }, { sparse: true });
+userSchema.index({ "vendorProfile.companyCode": 1 }, { sparse: true });
+
+// unique GSTIN for firms only (safe)
 userSchema.index(
   { "company.gstin": 1 },
   {
     unique: true,
     partialFilterExpression: {
-      "company.gstin": { $type: "string" },
+      "company.gstin": { $type: "string", $ne: "" },
       vendorCode: { $in: [null, ""] },
       firmId: { $eq: null },
     },
   },
 );
 
-/** =========================
- * ✅ Guards (prevent bad data from crashing)
- * ========================= */
+/* ---------------- Guards / Normalizers ---------------- */
+
+function normStr(v) {
+  if (v == null) return "";
+  return typeof v === "string" ? v.trim() : String(v);
+}
+
 userSchema.pre("validate", function (next) {
   try {
-    // normalize vendorCode
+    // normalize vendorCode -> null if empty
     if (typeof this.vendorCode === "string") {
       const v = this.vendorCode.trim();
       this.vendorCode = v ? v : null;
@@ -156,8 +236,8 @@ userSchema.pre("validate", function (next) {
     // ensure company exists
     if (!this.company) this.company = {};
 
-    // normalize company strings so undefined doesn't break UI
-    const fields = [
+    // normalize company strings
+    const companyFields = [
       "name",
       "industry",
       "gstin",
@@ -170,11 +250,73 @@ userSchema.pre("validate", function (next) {
       "state",
       "pincode",
     ];
-    for (const k of fields) {
+    for (const k of companyFields) {
       if (this.company[k] == null) this.company[k] = "";
       if (typeof this.company[k] === "string")
         this.company[k] = this.company[k].trim();
     }
+
+    // ensure vendorProfile exists
+    if (!this.vendorProfile) this.vendorProfile = {};
+
+    // if vendor account, keep vendorProfile.vendorCode in sync
+    if (this.vendorCode) {
+      this.vendorProfile.vendorCode = this.vendorCode;
+    } else {
+      // firm account -> keep vendorProfile.vendorCode null (but keep object for safety)
+      this.vendorProfile.vendorCode = null;
+    }
+
+    // normalize vendorProfile string fields (same keys as vendor schema)
+    const vp = this.vendorProfile || {};
+    const vendorFields = [
+      "countryKey",
+      "name",
+      "name1",
+      "name2",
+      "name3",
+      "name4",
+      "city",
+      "district",
+      "poBox",
+      "poBoxPostalCode",
+      "postalCode",
+      "creationDate",
+      "sortField",
+      "streetHouseNumber",
+      "panNumber",
+      "msme",
+      "gstin",
+      "orgName1",
+      "orgName2",
+      "companyCode",
+      "cityPostalCode",
+      "street",
+      "street2",
+      "street3",
+      "street4",
+      "street5",
+      "languageKey",
+      "region",
+    ];
+
+    for (const k of vendorFields) {
+      if (vp[k] == null) vp[k] = "";
+      vp[k] = normStr(vp[k]);
+    }
+
+    // normalize contactPerson array
+    if (!Array.isArray(vp.contactPerson)) vp.contactPerson = [];
+    vp.contactPerson = vp.contactPerson.map((cp) => ({
+      name: normStr(cp?.name),
+      email: normStr(cp?.email),
+      mobilePhoneIndicator: normStr(cp?.mobilePhoneIndicator),
+      fullPhoneNumber: normStr(cp?.fullPhoneNumber),
+      callerPhoneNumber: normStr(cp?.callerPhoneNumber),
+    }));
+
+    // write back
+    this.vendorProfile = vp;
 
     next();
   } catch (e) {
@@ -182,4 +324,9 @@ userSchema.pre("validate", function (next) {
   }
 });
 
-export default model("user", userSchema);
+/**
+ * IMPORTANT:
+ * Your refs already use ref: "users" (subscription middleware etc.)
+ * So keep model name "users" to match populate/ref usage.
+ */
+export default model("users", userSchema);

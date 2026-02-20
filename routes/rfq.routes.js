@@ -1,3 +1,4 @@
+// routes/rfq.routes.js
 import express from "express";
 import rfqModel from "../models/rfq.model.js";
 import { createError } from "../lib/customError.js";
@@ -14,49 +15,82 @@ import {
 import { PERMISSIONS } from "../lib/permissions.js";
 import csModel from "../models/cs.model.js";
 import indentModel from "../models/indent.model.js";
-import roleModel from "../models/role.model.js";
 import quotationModel from "../models/quotation.model.js";
-import { hashAsync } from "../helpers/hash.js";
 import { syncIndentQuantity } from "../helpers/syncIndentQuantity.js";
-// import { dateAsId } from "../helpers/formatDate.js"
 import fs from "fs/promises";
 
 const rfqRouter = express.Router();
 
+/* =========================
+ * Helpers (mail)
+ * ========================= */
+
+function pickVendorEmail(vendor) {
+  // vendor.contactPerson can be:
+  // - { email: "a@b.com" }
+  // - [{ email: "a@b.com" }, ...]
+  // - or vendor.email directly
+  const direct = String(vendor?.email || "").trim();
+  if (direct) return direct;
+
+  const cp = vendor?.contactPerson;
+
+  if (Array.isArray(cp)) {
+    const e = String(cp?.[0]?.email || "").trim();
+    if (e) return e;
+  } else if (cp && typeof cp === "object") {
+    const e = String(cp?.email || "").trim();
+    if (e) return e;
+  }
+
+  return "";
+}
+
+/**
+ * ✅ UPDATED: Do NOT create vendor user here.
+ * - Only fetch existing vendor user (if present) for link/token usage
+ * - Always send email to vendor email (from user.email if available, else from vendor payload)
+ */
 const mailRFQ = async (data, user) => {
   const emailRecipients = [];
 
-  for (const vendor of data.vendors) {
-    let vendorUser = await userModel.findOne(
-      { vendorCode: vendor.vendorCode },
-      { _id: 1, email: 1 },
+  for (const vendor of data.vendors || []) {
+    const vendorCode = String(vendor?.vendorCode || "").trim();
+    if (!vendorCode) continue;
+
+    // ✅ Only read users collection, no creation
+    const vendorUser = await userModel.findOne(
+      { vendorCode },
+      { _id: 1, email: 1 }
     );
 
-    if (!vendorUser) {
-      const vendorRole = await roleModel.findOne(
-        { permissions: { $in: [PERMISSIONS.VENDOR_ACCESS] } },
-        { _id: 1 },
+    const emailFromUser = String(vendorUser?.email || "").trim();
+    const emailFromPayload = pickVendorEmail(vendor);
+
+    const to = emailFromUser || emailFromPayload;
+    if (!to) {
+      // Don’t hard-fail whole RFQ; skip this vendor and log
+      console.warn(
+        `[RFQ mail] Missing email for vendorCode=${vendorCode}. userEmail=${emailFromUser} payloadEmail=${emailFromPayload}`
       );
-      const hashedPassword = await hashAsync(vendor.vendorCode, 10);
-      vendorUser = await userModel.create({
-        username: vendor.vendorCode,
-        vendorCode: vendor.vendorCode,
-        password: hashedPassword,
-        passwordStatus: "temporary",
-        createdBy: user,
-        name: vendor.name,
-        email: vendor.contactPerson.email,
-        role: vendorRole._id,
-      });
+      continue;
     }
 
+    // ✅ Keep same behavior: generate body with identifier
+    // If vendor user exists => use userId, else fallback to vendorCode
+    const identifier = vendorUser?._id
+      ? vendorUser._id.toString()
+      : vendorCode;
+
     emailRecipients.push({
-      to: vendorUser.email,
+      to,
       subject: "Request for Quotation",
-      text: generateEmailBody.rfq(data.dueDate, vendorUser._id.toString()),
+      text: generateEmailBody.rfq(data.dueDate, identifier),
     });
   }
+
   console.log("Email Recipients:", emailRecipients);
+
   const result = await sendMail(emailRecipients);
 
   if (!result.ok) {
@@ -64,6 +98,10 @@ const mailRFQ = async (data, user) => {
     throw new Error("Some vendor emails failed. Check SMTP logs for details.");
   }
 };
+
+/* =========================
+ * Routes (endpoints unchanged)
+ * ========================= */
 
 rfqRouter.post(
   "/",
@@ -118,7 +156,7 @@ rfqRouter.post(
     } catch (error) {
       next(error);
     }
-  },
+  }
 );
 
 rfqRouter.post("/list", async (req, res, next) => {
@@ -179,11 +217,11 @@ rfqRouter.post("/list", async (req, res, next) => {
         filter.rfqDate = {};
         if (filters.rfqDate[0])
           filter.rfqDate["$gte"] = new Date(
-            new Date(filters.rfqDate[0]).setHours(0, 0, 0, 0),
+            new Date(filters.rfqDate[0]).setHours(0, 0, 0, 0)
           );
         if (filters.rfqDate[1])
           filter.rfqDate["$lte"] = new Date(
-            new Date(filters.rfqDate[1]).setHours(24, 0, 0, 0) - 1,
+            new Date(filters.rfqDate[1]).setHours(24, 0, 0, 0) - 1
           );
       }
       if (filters.indentNumber)
@@ -292,11 +330,7 @@ rfqRouter.post("/list", async (req, res, next) => {
       ];
     }
 
-    const response = await dataTable(
-      { ...params, matchQuery },
-      rfqModel,
-      pipeline,
-    );
+    const response = await dataTable({ ...params, matchQuery }, rfqModel, pipeline);
 
     res.status(200).send(response);
   } catch (error) {
@@ -309,16 +343,12 @@ rfqRouter.get("/values", async (req, res, next) => {
     const { all } = req.query;
     let matchQuery = { status: 1 };
     if (!all) {
-      const userClinics = (
-        await userModel.findById(req.user._id, { clinics: 1 })
-      )?.clinics;
+      const userClinics = (await userModel.findById(req.user._id, { clinics: 1 }))?.clinics;
       matchQuery._id = { $in: userClinics };
     }
 
     const clinics = await rfqModel.aggregate([
-      {
-        $match: matchQuery,
-      },
+      { $match: matchQuery },
       {
         $project: {
           value: "$_id",
@@ -338,19 +368,13 @@ rfqRouter.put(
   async (req, res, next) => {
     try {
       const { rfqNumber, dueDate, dueDateRemarks } = req.body;
-      const rfq = await rfqModel.findOne(
-        { rfqNumber },
-        { dueDate: 1, dueDateRemarks: 1 },
-      );
+      const rfq = await rfqModel.findOne({ rfqNumber }, { dueDate: 1, dueDateRemarks: 1 });
       if (!rfq) throw createError("RFQ not found", 404);
 
       const result = await rfqModel.findByIdAndUpdate(
         rfq._id,
         {
-          $set: {
-            dueDate,
-            dueDateRemarks,
-          },
+          $set: { dueDate, dueDateRemarks },
           $push: {
             prevDueDates: {
               dueDate: rfq.dueDate,
@@ -358,22 +382,18 @@ rfqRouter.put(
             },
           },
         },
-        { new: true },
+        { new: true }
       );
 
       res.status(200).json(result);
     } catch (error) {
       next(error);
     }
-  },
+  }
 );
 
 rfqRouter.get("/rfqNumber", async (req, res, next) => {
   try {
-    // const dateId = dateAsId()
-    // const randomCombo =
-    // 	String.fromCharCode(65 + Math.floor(Math.random() * 26))?.toUpperCase() + Math.floor(Math.random() * 10)
-    // const rfqNumber = ["R", dateId, randomCombo].join("/")
     const count = await rfqModel.countDocuments();
     res.status(200).json({ rfqNumber: count + 1 });
   } catch (error) {
@@ -415,16 +435,13 @@ rfqRouter.get(
     } catch (error) {
       next(error);
     }
-  },
+  }
 );
 
 rfqRouter.get("/vendors/:id", async (req, res, next) => {
   try {
-    // if (req.user.vendorCode) {
     const vendors = await rfqModel.aggregate([
-      {
-        $match: { _id: new Types.ObjectId(req.params.id) },
-      },
+      { $match: { _id: new Types.ObjectId(req.params.id) } },
       {
         $set: {
           "vendors.rfqNumber": "$rfqNumber",
@@ -432,47 +449,23 @@ rfqRouter.get("/vendors/:id", async (req, res, next) => {
           "vendors.items": "$items",
         },
       },
-      {
-        $unwind: {
-          path: "$vendors",
-          preserveNullAndEmptyArrays: false,
-        },
-      },
-      {
-        $replaceRoot: {
-          newRoot: "$vendors",
-        },
-      },
+      { $unwind: { path: "$vendors", preserveNullAndEmptyArrays: false } },
+      { $replaceRoot: { newRoot: "$vendors" } },
       ...(req.user.vendorCode
-        ? [
-            {
-              $match: {
-                vendorCode: req.user.vendorCode,
-              },
-            },
-          ]
+        ? [{ $match: { vendorCode: req.user.vendorCode } }]
         : []),
       {
         $lookup: {
           from: "quotations",
-          let: {
-            vendorId: "$vendorCode",
-            rfqNumber: "$rfqNumber",
-          },
+          let: { vendorId: "$vendorCode", rfqNumber: "$rfqNumber" },
           pipeline: [
             {
               $match: {
-                status: {
-                  $gte: 1,
-                },
+                status: { $gte: 1 },
                 $expr: {
                   $and: [
-                    {
-                      $eq: ["$vendorCode", "$$vendorId"],
-                    },
-                    {
-                      $eq: ["$rfqNumber", "$$rfqNumber"],
-                    },
+                    { $eq: ["$vendorCode", "$$vendorId"] },
+                    { $eq: ["$rfqNumber", "$$rfqNumber"] },
                   ],
                 },
               },
@@ -481,17 +474,10 @@ rfqRouter.get("/vendors/:id", async (req, res, next) => {
           as: "quotation",
         },
       },
-      {
-        $set: {
-          quotation: {
-            $first: "$quotation",
-          },
-        },
-      },
+      { $set: { quotation: { $first: "$quotation" } } },
     ]);
 
-    if (!vendors?.length)
-      throw createError("No vendors found for this RFQ", 404);
+    if (!vendors?.length) throw createError("No vendors found for this RFQ", 404);
 
     for (const vendor of vendors) {
       if (!vendor.quotation) continue;
@@ -500,9 +486,7 @@ rfqRouter.get("/vendors/:id", async (req, res, next) => {
       if (!vendor.quotation.items?.length) continue;
       for (const item of vendor.quotation.items) {
         const rfqItem = vendor.items.find(
-          (i) =>
-            i.itemCode === item.itemCode &&
-            i.indentNumber === item.indentNumber,
+          (i) => i.itemCode === item.itemCode && i.indentNumber === item.indentNumber
         );
         if (!rfqItem) continue;
         item.itemDescription = rfqItem.itemDescription;
@@ -511,16 +495,8 @@ rfqRouter.get("/vendors/:id", async (req, res, next) => {
     }
 
     const cs = await csModel.aggregate([
-      {
-        $match: { rfqNumber: vendors[0].rfqNumber },
-      },
-      {
-        $project: {
-          _id: 1,
-          csNumber: 1,
-          status: 1,
-        },
-      },
+      { $match: { rfqNumber: vendors[0].rfqNumber } },
+      { $project: { _id: 1, csNumber: 1, status: 1 } },
       {
         $lookup: {
           from: "purchase_orders",
@@ -529,13 +505,7 @@ rfqRouter.get("/vendors/:id", async (req, res, next) => {
           as: "poNumber",
         },
       },
-      {
-        $set: {
-          poNumber: {
-            $first: "$poNumber.poNumber",
-          },
-        },
-      },
+      { $set: { poNumber: { $first: "$poNumber.poNumber" } } },
     ]);
 
     res.status(200).json({ vendors, cs: cs?.[0] });
@@ -547,16 +517,8 @@ rfqRouter.get("/vendors/:id", async (req, res, next) => {
 rfqRouter.post("/vendor/list/:id", async (req, res, next) => {
   try {
     const vendors = await rfqModel.aggregate([
-      {
-        $match: {
-          "vendors.vendorCode": req.params.id,
-        },
-      },
-      {
-        $sort: {
-          dueDate: -1,
-        },
-      },
+      { $match: { "vendors.vendorCode": req.params.id } },
+      { $sort: { dueDate: -1 } },
       {
         $project: {
           rfqNumber: 1,
@@ -607,7 +569,7 @@ rfqRouter.get("/negotiation", async (req, res, next) => {
         "items.itemCode": 1,
         "items.rfqMake": 1,
         termsConditions: 1,
-      },
+      }
     );
     if (!rfq) throw createError("RFQ not found", 404);
     res.status(200).json(rfq);
@@ -626,7 +588,7 @@ rfqRouter.get("/:id", async (req, res, next) => {
     data.rfq = await rfqModel.findOne(
       id.length === 24
         ? { $or: [{ _id: new Types.ObjectId(id) }, { rfqNumber: id }] }
-        : { rfqNumber: id },
+        : { rfqNumber: id }
     );
 
     if (!data.rfq) throw createError("RFQ not found", 404);
@@ -636,7 +598,7 @@ rfqRouter.get("/:id", async (req, res, next) => {
       req.user?.permissions?.includes(PERMISSIONS.VENDOR_ACCESS)
     )
       data.rfq.vendors = data.rfq.vendors.filter(
-        (i) => i.vendorCode === req.user.vendorCode,
+        (i) => i.vendorCode === req.user.vendorCode
       );
 
     if (indents) {
@@ -674,7 +636,7 @@ rfqRouter.put(
       const updatedRFQ = await rfqModel.findByIdAndUpdate(
         req.params.id,
         { $set: data },
-        { new: true },
+        { new: true }
       );
       if (!updatedRFQ) throw createError("RFQ not found", 404);
 
@@ -700,7 +662,7 @@ rfqRouter.put(
     } catch (error) {
       next(error);
     }
-  },
+  }
 );
 
 rfqRouter.patch(
@@ -724,7 +686,7 @@ rfqRouter.patch(
       try {
         await mailRFQ(
           { ...rfq.toObject(), vendors: [vendor], dueDate: rfq.dueDate },
-          req.user._id,
+          req.user._id
         );
       } catch (error) {
         errorMessage = "Vendor added but failed to send rfq email.";
@@ -734,7 +696,7 @@ rfqRouter.patch(
     } catch (error) {
       next(error);
     }
-  },
+  }
 );
 
 rfqRouter.patch(
@@ -767,7 +729,7 @@ rfqRouter.patch(
     } catch (error) {
       next(error);
     }
-  },
+  }
 );
 
 rfqRouter.delete(
@@ -788,7 +750,7 @@ rfqRouter.delete(
       if (recordsExists)
         throw createError(
           recordsExists + " quotations have been submitted for this RFQ.",
-          400,
+          400
         );
       else {
         await rfqModel.findByIdAndDelete(req.params.id);
@@ -809,7 +771,7 @@ rfqRouter.delete(
     } catch (error) {
       next(error);
     }
-  },
+  }
 );
 
 export default rfqRouter;

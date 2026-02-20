@@ -1,7 +1,11 @@
 import express from "express";
-import vendorModel from "../models/vendor.model.js";
+import bcrypt from "bcryptjs";
+
+import userModel from "../models/user.model.js";
 import preapprovedVendorModel from "../models/preapprovedVendor.model.js";
 import counterModel from "../models/counter.model.js";
+import roleModel from "../models/role.model.js";
+import { PERMISSIONS } from "../lib/permissions.js";
 
 const preapprovedVendorRouter = express.Router();
 
@@ -20,14 +24,35 @@ const COMPANY_PREFIX = "CN";
 const COMPANY_PAD_LEN = 5;
 
 function pad(num, len) {
-  return String(num).padStart(len, "0");
+  const s = String(num);
+  const width = Math.max(len, s.length);
+  return s.padStart(width, "0");
 }
 
-function parseSeq(code, prefix) {
-  if (!code || typeof code !== "string") return 0;
-  if (!code.startsWith(prefix)) return 0;
-  const n = parseInt(code.slice(prefix.length), 10);
-  return Number.isFinite(n) ? n : 0;
+/** numeric-safe max sequence finder */
+async function getMaxSeq(model, field, prefix) {
+  const PREFIX_LEN = prefix.length;
+  const regex = new RegExp(`^${prefix}\\d+$`);
+
+  const result = await model.aggregate([
+    { $match: { [field]: { $regex: regex } } },
+    {
+      $project: {
+        seq: {
+          $toInt: {
+            $substrCP: [
+              `$${field}`,
+              PREFIX_LEN,
+              { $subtract: [{ $strLenCP: `$${field}` }, PREFIX_LEN] },
+            ],
+          },
+        },
+      },
+    },
+    { $group: { _id: null, maxSeq: { $max: "$seq" } } },
+  ]);
+
+  return result?.[0]?.maxSeq || 0;
 }
 
 let initVendorPromise = null;
@@ -37,17 +62,10 @@ async function ensureVendorCounterInitialized() {
   if (initVendorPromise) return initVendorPromise;
 
   initVendorPromise = (async () => {
-    const maxDoc = await vendorModel
-      .findOne({ vendorCode: new RegExp(`^${VENDOR_PREFIX}\\d+$`) })
-      .sort({ vendorCode: -1 })
-      .select({ vendorCode: 1 })
-      .lean();
-
-    const maxSeq = maxDoc ? parseSeq(maxDoc.vendorCode, VENDOR_PREFIX) : 0;
-
+    const maxSeq = await getMaxSeq(userModel, "vendorCode", VENDOR_PREFIX);
     await counterModel.findByIdAndUpdate(
       VENDOR_COUNTER_ID,
-      { $max: { seq: maxSeq } },
+      { $setOnInsert: { _id: VENDOR_COUNTER_ID }, $max: { seq: maxSeq } },
       { upsert: true, new: true }
     );
   })();
@@ -68,36 +86,23 @@ async function nextVendorCode() {
   return `${VENDOR_PREFIX}${pad(seq, VENDOR_PAD_LEN)}`;
 }
 
-/**
- * Company counter init should consider BOTH collections
- * (because companyCode exists in preapproved + vendor master)
- */
 async function ensureCompanyCounterInitialized() {
   if (initCompanyPromise) return initCompanyPromise;
 
   initCompanyPromise = (async () => {
-    const regex = new RegExp(`^${COMPANY_PREFIX}\\d+$`);
-
-    const [maxVendor, maxPre] = await Promise.all([
-      vendorModel
-        .findOne({ companyCode: regex })
-        .sort({ companyCode: -1 })
-        .select({ companyCode: 1 })
-        .lean(),
-      preapprovedVendorModel
-        .findOne({ companyCode: regex })
-        .sort({ companyCode: -1 })
-        .select({ companyCode: 1 })
-        .lean(),
+    const [maxUser, maxPre] = await Promise.all([
+      // NOTE: your user schema stores companyCode in vendorProfile.companyCode, not root
+      getMaxSeq(userModel, "vendorProfile.companyCode", COMPANY_PREFIX).catch(
+        () => 0
+      ),
+      getMaxSeq(preapprovedVendorModel, "companyCode", COMPANY_PREFIX),
     ]);
 
-    const maxSeqVendor = maxVendor ? parseSeq(maxVendor.companyCode, COMPANY_PREFIX) : 0;
-    const maxSeqPre = maxPre ? parseSeq(maxPre.companyCode, COMPANY_PREFIX) : 0;
-    const maxSeq = Math.max(maxSeqVendor, maxSeqPre);
+    const maxSeq = Math.max(maxUser || 0, maxPre || 0);
 
     await counterModel.findByIdAndUpdate(
       COMPANY_COUNTER_ID,
-      { $max: { seq: maxSeq } },
+      { $setOnInsert: { _id: COMPANY_COUNTER_ID }, $max: { seq: maxSeq } },
       { upsert: true, new: true }
     );
   })();
@@ -118,28 +123,97 @@ async function nextCompanyCode() {
   return `${COMPANY_PREFIX}${pad(seq, COMPANY_PAD_LEN)}`;
 }
 
-/** =========================
- *  Routes
- *  ========================= */
+/* ---------------- helpers ---------------- */
 
-// ✅ Create preapproved vendor (pending by default) + auto companyCode (CN00001...)
+function normStr(v) {
+  if (v == null) return "";
+  return typeof v === "string" ? v.trim() : String(v);
+}
+
+function toLowerEmail(v) {
+  const s = normStr(v);
+  return s ? s.toLowerCase() : "";
+}
+
+/**
+ * ✅ Map preapprovedVendor -> users.vendorProfile (matches your User schema exactly)
+ */
+function buildVendorProfileFromPreapproved(pre, vendorCode) {
+  const contactPerson = Array.isArray(pre?.contactPerson)
+    ? pre.contactPerson.map((cp) => ({
+        // user schema: VendorContactPersonSchema (_id:false)
+        name: normStr(cp?.name),
+        email: toLowerEmail(cp?.email),
+        mobilePhoneIndicator: normStr(cp?.mobilePhoneIndicator), // might not exist -> ""
+        fullPhoneNumber: normStr(cp?.fullPhoneNumber),
+        callerPhoneNumber: normStr(cp?.callerPhoneNumber), // might not exist -> ""
+      }))
+    : [];
+
+  const companyCode = normStr(pre?.companyCode);
+
+  return {
+    vendorCode, // keep in sync; your pre("validate") also does this
+    companyCode,
+
+    // these are the fields you showed in preapproved doc
+    name: normStr(pre?.name),
+    city: normStr(pre?.city),
+    district: normStr(pre?.district),
+    postalCode: normStr(pre?.postalCode),
+    panNumber: normStr(pre?.panNumber),
+    msme: normStr(pre?.msme),
+    gstin: normStr(pre?.gstin),
+    street: normStr(pre?.street),
+    languageKey: normStr(pre?.languageKey),
+    region: normStr(pre?.region),
+
+    // optional “orgName1/orgName2” in your schema
+    orgName1: normStr(pre?.name), // sensible default
+    orgName2: "",
+
+    // keep other vendorProfile fields as empty strings (schema defaults cover it)
+    countryKey: normStr(pre?.countryKey),
+    name1: "",
+    name2: "",
+    name3: "",
+    name4: "",
+    poBox: normStr(pre?.poBox),
+    poBoxPostalCode: normStr(pre?.poBoxPostalCode),
+    creationDate: normStr(pre?.creationDate),
+    sortField: normStr(pre?.sortField),
+    streetHouseNumber: normStr(pre?.streetHouseNumber),
+    cityPostalCode: normStr(pre?.cityPostalCode),
+    street2: normStr(pre?.street2),
+    street3: normStr(pre?.street3),
+    street4: normStr(pre?.street4),
+    street5: normStr(pre?.street5),
+
+    contactPerson,
+  };
+}
+
+/* =========================
+ * Routes
+ * ========================= */
+
+// Create preapproved vendor (pending) + auto companyCode
 preapprovedVendorRouter.post("/", async (req, res, next) => {
   try {
     const payload = req.body || {};
 
-    const name = String(payload.name || "").trim();
+    const name = normStr(payload.name);
     if (!name) {
-      return res.status(400).send({ success: false, message: "name is required" });
+      return res
+        .status(400)
+        .send({ success: false, message: "name is required" });
     }
 
-    // ✅ always auto-generate companyCode if not provided
-    // (recommended: do not trust client for sequential codes)
-    let companyCode = String(payload.companyCode || "").trim();
+    let companyCode = normStr(payload.companyCode);
     if (!companyCode) {
       companyCode = await nextCompanyCode();
     }
 
-    // ✅ handle unique collision just like vendorCode (rare but safe)
     let created = null;
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
@@ -148,7 +222,9 @@ preapprovedVendorRouter.post("/", async (req, res, next) => {
           name,
           companyCode,
           status: "pending",
-          contactPerson: Array.isArray(payload.contactPerson) ? payload.contactPerson : [],
+          contactPerson: Array.isArray(payload.contactPerson)
+            ? payload.contactPerson
+            : [],
         });
         break;
       } catch (e) {
@@ -173,7 +249,7 @@ preapprovedVendorRouter.post("/", async (req, res, next) => {
   }
 });
 
-// ✅ List preapproved vendors
+// List preapproved vendors
 preapprovedVendorRouter.get("/list", async (req, res, next) => {
   try {
     const { status, search } = req.query;
@@ -191,23 +267,23 @@ preapprovedVendorRouter.get("/list", async (req, res, next) => {
       ];
     }
 
-    const data = await preapprovedVendorModel.find(match).sort({ createdAt: -1 });
+    const data = await preapprovedVendorModel
+      .find(match)
+      .sort({ createdAt: -1 });
+
     res.status(200).send({ success: true, data });
   } catch (err) {
     next(err);
   }
 });
 
-// ✅ Update preapproved vendor (only if still pending)
+// Update preapproved vendor (only if pending)
 preapprovedVendorRouter.put("/:id", async (req, res, next) => {
   try {
     const id = req.params.id;
     const payload = req.body || {};
 
-    // Don't allow status to be changed here
     if (payload.status) delete payload.status;
-
-    // OPTIONAL: block editing companyCode (recommended)
     if (payload.companyCode) delete payload.companyCode;
 
     const updated = await preapprovedVendorModel.findOneAndUpdate(
@@ -229,62 +305,112 @@ preapprovedVendorRouter.put("/:id", async (req, res, next) => {
   }
 });
 
-// ✅ Approve: push to main vendor collection (auto vendorCode) + mark approved
+// ✅ Approve: create vendor USER correctly (map -> vendorProfile)
 preapprovedVendorRouter.post("/:id/approve", async (req, res, next) => {
   try {
     const id = req.params.id;
 
     const pre = await preapprovedVendorModel.findById(id);
-    if (!pre) return res.status(404).send({ success: false, message: "Preapproved vendor not found" });
-
-    if (pre.status === "approved") {
-      return res.status(400).send({ success: false, message: "Already approved" });
+    if (!pre) {
+      return res
+        .status(404)
+        .send({ success: false, message: "Preapproved vendor not found" });
     }
 
-    // ✅ fallback: if somehow companyCode missing, generate now
-    if (!String(pre.companyCode || "").trim()) {
+    if (pre.status === "approved") {
+      return res
+        .status(400)
+        .send({ success: false, message: "Already approved" });
+    }
+
+    const vendorRole = await roleModel.findOne(
+      { permissions: { $in: [PERMISSIONS.VENDOR_ACCESS] }, status: 1 },
+      { _id: 1 }
+    );
+
+    if (!vendorRole?._id) {
+      return res.status(500).send({
+        success: false,
+        message: `Vendor role not found. Create a role having permission "${PERMISSIONS.VENDOR_ACCESS}".`,
+      });
+    }
+
+    // Ensure companyCode exists on preapproved record
+    if (!normStr(pre.companyCode)) {
       pre.companyCode = await nextCompanyCode();
       await pre.save();
     }
 
-    const obj = pre.toObject();
-    delete obj._id;
-    delete obj.__v;
-    delete obj.status;
-    delete obj.createdAt;
-    delete obj.updatedAt;
+    // Extract primary contact email
+    const contactEmail =
+      Array.isArray(pre.contactPerson) && pre.contactPerson.length > 0
+        ? toLowerEmail(pre.contactPerson[0]?.email)
+        : "";
 
-    let createdVendor = null;
+    let createdVendorUser = null;
 
     for (let attempt = 0; attempt < 5; attempt++) {
       const vendorCode = await nextVendorCode();
+
       try {
-        createdVendor = await vendorModel.create({
-          ...obj,
-          vendorCode, // ✅ auto generated here
-          companyCode: obj.companyCode, // ✅ keep same company code
+        const username = vendorCode;
+        const passwordHash = await bcrypt.hash(vendorCode, 10);
+
+        // ✅ build vendorProfile from preapproved fields
+        const vendorProfile = buildVendorProfileFromPreapproved(pre, vendorCode);
+
+        createdVendorUser = await userModel.create({
+          // identity flags
+          vendorCode,
+          firmId: null,
+
+          // role
+          role: vendorRole._id,
+
+          // login
+          username,
+          password: passwordHash,
+          passwordStatus: "temporary",
+
+          // required fields
+          name: normStr(pre.name) || vendorCode,
+          email: contactEmail || "",
+
+          // ✅ IMPORTANT: put preapproved fields inside vendorProfile
+          vendorProfile,
+
+          // system
+          createdBy: req?.user?._id || req?.user?.id || null,
+          status: 1,
         });
+
         break;
       } catch (e) {
-        if (e?.code === 11000) continue;
+        if (e?.code === 11000) continue; // retry vendorCode/username collision
         throw e;
       }
     }
 
-    if (!createdVendor) {
+    if (!createdVendorUser) {
       return res.status(500).send({
         success: false,
-        message: "Failed to create vendor with unique vendorCode",
+        message:
+          "Failed to create vendor user with unique vendorCode/username",
       });
     }
 
     pre.status = "approved";
     await pre.save();
 
-    res.status(200).send({
+    return res.status(200).send({
       success: true,
-      message: "Vendor approved and moved to vendor master",
-      vendor: createdVendor,
+      message: "Vendor approved and created in users collection",
+      vendorUser: createdVendorUser,
+      credentials: {
+        username: createdVendorUser.username,
+        password: createdVendorUser.vendorCode,
+        vendorCode: createdVendorUser.vendorCode,
+      },
     });
   } catch (err) {
     next(err);

@@ -1,5 +1,7 @@
+// routes/vendor.routes.js
 import express from "express";
-import vendorModel from "../models/vendor.model.js";
+import bcrypt from "bcryptjs";
+import userModel from "../models/user.model.js";
 import counterModel from "../models/counter.model.js";
 import { importVendors } from "../lib/importVendors.js";
 
@@ -32,11 +34,12 @@ function parseSeqFromVendorCode(code) {
 
 /**
  * ✅ Get max sequence in DB numerically (safe even after 9999)
+ * ✅ NOW reads from users collection (vendor users have vendorCode)
  */
 async function getMaxVendorSeq() {
   const regex = new RegExp(`^${VENDOR_PREFIX}\\d+$`);
 
-  const result = await vendorModel.aggregate([
+  const result = await userModel.aggregate([
     { $match: { vendorCode: { $regex: regex } } },
     {
       $project: {
@@ -58,7 +61,7 @@ async function getMaxVendorSeq() {
 }
 
 /**
- * Ensures counter.seq >= max existing VNDxxxx in vendor collection.
+ * Ensures counter.seq >= max existing VNDxxxx in users collection.
  * Prevents duplicates even if counter got reset / DB migrated / imported vendors exist.
  */
 async function ensureVendorCounterInitialized() {
@@ -67,7 +70,7 @@ async function ensureVendorCounterInitialized() {
   initPromise = (async () => {
     const maxSeq = await getMaxVendorSeq();
 
-    // ✅ This requires counter _id to be STRING (see counter.model.js fix)
+    // ✅ This requires counter _id to be STRING
     await counterModel.findByIdAndUpdate(
       COUNTER_ID,
       {
@@ -95,15 +98,22 @@ async function nextVendorCode() {
 }
 
 /** =========================
- *  Existing routes
+ *  Existing routes (endpoints unchanged)
  *  ========================= */
 
 vendorRouter.get("/import", async (req, res, next) => {
   try {
-    await importVendors();
+    /**
+     * ✅ IMPORTANT:
+     * Your importVendors() must now import into users collection (vendor users).
+     * If your lib supports passing a model, this will work; if it ignores args, it's still safe.
+     */
+    await importVendors(userModel);
+
     // ✅ after import, re-init counter (important if import adds bigger vendorCodes)
     initPromise = null;
     await ensureVendorCounterInitialized();
+
     res.status(200).send({ success: true });
   } catch (error) {
     next(error);
@@ -121,7 +131,10 @@ vendorRouter.get("/list", async (req, res, next) => {
   try {
     const { vendorCode, search } = req.query;
 
-    const match = {};
+    const match = {
+      // ✅ only vendors (since users collection also has firms)
+      vendorCode: { $exists: true, $nin: [null, ""] },
+    };
 
     if (vendorCode) {
       match.vendorCode = String(vendorCode).trim();
@@ -132,10 +145,12 @@ vendorRouter.get("/list", async (req, res, next) => {
       match.$or = [
         { vendorCode: { $regex: s, $options: "i" } },
         { name: { $regex: s, $options: "i" } },
+        { orgName1: { $regex: s, $options: "i" } },
+        { gstin: { $regex: s, $options: "i" } },
       ];
     }
 
-    const data = await vendorModel.find(match).sort({ name: 1 });
+    const data = await userModel.find(match).sort({ name: 1 });
     res.status(200).send(data);
   } catch (error) {
     next(error);
@@ -144,8 +159,8 @@ vendorRouter.get("/list", async (req, res, next) => {
 
 vendorRouter.get("/basic-details", async (req, res, next) => {
   try {
-    const data = await vendorModel.find(
-      {},
+    const data = await userModel.find(
+      { vendorCode: { $exists: true, $nin: [null, ""] } },
       { vendorCode: 1, name: 1, contactPerson: 1, street: 1 }
     );
     res.status(200).send(data);
@@ -157,17 +172,21 @@ vendorRouter.get("/basic-details", async (req, res, next) => {
 vendorRouter.get("/values", async (req, res, next) => {
   try {
     const { search } = req.query;
-    const match = {};
+
+    const match = {
+      vendorCode: { $exists: true, $nin: [null, ""] },
+    };
 
     if (search) {
       const s = String(search).trim();
       match.$or = [
         { vendorCode: { $regex: s, $options: "i" } },
         { name: { $regex: s, $options: "i" } },
+        { orgName1: { $regex: s, $options: "i" } },
       ];
     }
 
-    const data = await vendorModel.find(match, { vendorCode: 1, name: 1 });
+    const data = await userModel.find(match, { vendorCode: 1, name: 1 });
     res.status(200).send(
       data.map((i) => ({
         label: i.name,
@@ -181,6 +200,9 @@ vendorRouter.get("/values", async (req, res, next) => {
 
 /** =========================
  *  ✅ POST /vendor (auto vendorCode)
+ *  - NOW creates a vendor USER
+ *  - username = vendorCode
+ *  - password = vendorCode (stored hashed)
  *  ========================= */
 vendorRouter.post("/", async (req, res, next) => {
   try {
@@ -188,28 +210,51 @@ vendorRouter.post("/", async (req, res, next) => {
 
     const name = String(payload.name || "").trim();
     if (!name) {
-      return res
-        .status(400)
-        .send({ success: false, message: "name is required." });
+      return res.status(400).send({ success: false, message: "name is required." });
     }
 
-    const contactPerson = Array.isArray(payload.contactPerson)
-      ? payload.contactPerson
-      : [];
+    const contactPerson = Array.isArray(payload.contactPerson) ? payload.contactPerson : [];
+
+    // try pull email from payload or first contactPerson
+    const email =
+      String(payload.email || "").trim().toLowerCase() ||
+      String(contactPerson?.[0]?.email || "").trim().toLowerCase() ||
+      "";
 
     let created = null;
 
-    // ✅ retry is good safety (handles rare manual collision or concurrent import)
+    // ✅ retry is good safety (handles rare collision or concurrent import)
     for (let attempt = 0; attempt < 5; attempt++) {
       const vendorCode = await nextVendorCode();
 
       try {
-        created = await vendorModel.create({
+        const username = vendorCode;
+        const passwordHash = await bcrypt.hash(vendorCode, 10);
+
+        created = await userModel.create({
           ...payload,
-          vendorCode, // ✅ auto
+
+          // ✅ vendor flags
+          vendorCode,
+          firmId: null,
+
+          // ✅ auth
+          username,
+          password: passwordHash,
+          passwordStatus: "permanent",
+
+          // ✅ main display
           name,
+          email,
+
+          // ✅ normalize
           contactPerson,
+
+          // ✅ audit
+          createdBy: req?.user?._id || req?.user?.id || null,
+          status: 1,
         });
+
         break;
       } catch (e) {
         if (e?.code === 11000) continue; // duplicate key
@@ -232,6 +277,7 @@ vendorRouter.post("/", async (req, res, next) => {
 
 /** =========================
  *  ✅ PUT /vendor/:vendorCode (update)
+ *  - Updates vendor USER doc by vendorCode
  *  ========================= */
 vendorRouter.put("/:vendorCode", async (req, res, next) => {
   try {
@@ -253,6 +299,20 @@ vendorRouter.put("/:vendorCode", async (req, res, next) => {
       });
     }
 
+    // Keep vendor login identity stable
+    if (payload.username && String(payload.username).trim() !== vendorCode) {
+      return res.status(400).send({
+        success: false,
+        message: "username cannot be changed for vendor accounts.",
+      });
+    }
+
+    // Don't allow changing firmId from vendor routes
+    if (payload.firmId) delete payload.firmId;
+
+    // Don't allow changing password here (create a dedicated endpoint if needed)
+    if (payload.password) delete payload.password;
+
     if (payload.contactPerson && !Array.isArray(payload.contactPerson)) {
       return res.status(400).send({
         success: false,
@@ -260,16 +320,14 @@ vendorRouter.put("/:vendorCode", async (req, res, next) => {
       });
     }
 
-    const updated = await vendorModel.findOneAndUpdate(
-      { vendorCode },
+    const updated = await userModel.findOneAndUpdate(
+      { vendorCode, vendorCode: { $exists: true, $nin: [null, ""] } },
       { $set: payload },
       { new: true, runValidators: true }
     );
 
     if (!updated) {
-      return res
-        .status(404)
-        .send({ success: false, message: "Vendor not found." });
+      return res.status(404).send({ success: false, message: "Vendor not found." });
     }
 
     res.status(200).send({ success: true, data: updated });

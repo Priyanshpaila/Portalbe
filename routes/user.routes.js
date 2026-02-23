@@ -982,8 +982,7 @@ userRouter.post("/firm/employees", async (req, res, next) => {
   try {
     const me = await getMe(req);
     if (!me) throw createError("User not found", 404);
-    if (!isFirmRoot(me))
-      throw createError("Only firm root can create employees", 403);
+    if (!isFirmRoot(me)) throw createError("Only firm root can create employees", 403);
 
     const { username, password, name, email, role } = req.body || {};
     if (!username || !password || !name) {
@@ -991,8 +990,7 @@ userRouter.post("/firm/employees", async (req, res, next) => {
     }
 
     const activeSub = await getActiveSubscription(me._id);
-    if (!activeSub)
-      throw createError("Active subscription required to add employees", 402);
+    if (!activeSub) throw createError("Active subscription required to add employees", 402);
 
     const seatsAllowed = Number(activeSub?.notes?.seats || 0);
     if (seatsAllowed > 0) {
@@ -1005,11 +1003,28 @@ userRouter.post("/firm/employees", async (req, res, next) => {
       }
     }
 
-    const hashedPassword = await hashAsync(password, 10);
+    // ✅ normalize + clone company snapshot from firm root
+    const normalizeCompany = (c) => ({
+      name: String(c?.name || "").trim(),
+      industry: String(c?.industry || "").trim(),
+      gstin: String(c?.gstin || "").trim(),
+      pan: String(c?.pan || "").trim(),
+      phone: String(c?.phone || "").trim(),
+      website: String(c?.website || "").trim(),
+      addressLine1: String(c?.addressLine1 || "").trim(),
+      addressLine2: String(c?.addressLine2 || "").trim(),
+      city: String(c?.city || "").trim(),
+      state: String(c?.state || "").trim(),
+      pincode: String(c?.pincode || "").trim(),
+    });
+
+    const companySnapshot = normalizeCompany((me)?.company);
+
+    const hashedPassword = await hashAsync(String(password), 10);
 
     const employee = await User.create({
-      _id: new Types.ObjectId().toString(),
-      firmId: me._id,
+      _id: new Types.ObjectId(),              // ✅ keep as ObjectId
+      firmId: me._id,                         // firm owner id
       username: String(username).trim(),
       password: hashedPassword,
       passwordStatus: "temporary",
@@ -1018,6 +1033,9 @@ userRouter.post("/firm/employees", async (req, res, next) => {
       email: email ? String(email).trim() : "",
       role: role || null,
       status: 1,
+
+      // ✅ HERE: copy firm root company into employee
+      company: companySnapshot,
     });
 
     const json = employee.toJSON();
@@ -1440,6 +1458,7 @@ userRouter.get("/directory", async (req, res, next) => {
       const baseMatch = {
         status: 1,
         vendorCode: null,
+        firmId: null,
       };
 
       const firmQuery = { ...baseMatch };

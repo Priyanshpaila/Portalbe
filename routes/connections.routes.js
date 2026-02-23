@@ -382,16 +382,20 @@ router.post("/links/invite", async (req, res, next) => {
     if (!userId || !me) return res.status(401).json({ ok: false, message: "Unauthorized" });
     if (me.vendorCode) return res.status(403).json({ ok: false, message: "Vendors cannot invite vendors" });
 
+    // ✅ IMPORTANT: firm employee => firmId, firm root => userId
     const firmOwnerId = getFirmOwnerIdFromMe(me, userId);
 
     const { vendorCode, message } = req.body || {};
     const code = String(vendorCode || "").trim();
     if (!code) return res.status(400).json({ ok: false, message: "vendorCode is required" });
 
-    const vendorUser = await userModel.findOne({ vendorCode: code, status: { $ne: 0 } }, { vendorCode: 1 }).lean();
+    const vendorUser = await userModel.findOne(
+      { vendorCode: code, status: { $ne: 0 } },
+      { vendorCode: 1 }
+    ).lean();
     if (!vendorUser) return res.status(404).json({ ok: false, message: "Vendor not found" });
 
-    // prevent duplicates
+    // ✅ duplicate check MUST use firmOwnerId (root), not userId
     const existing = await vendorFirmLinkModel.findOne({
       firmId: firmOwnerId,
       vendorCode: code,
@@ -402,12 +406,16 @@ router.post("/links/invite", async (req, res, next) => {
       return res.json({ ok: true, link: existing, message: "Already exists" });
     }
 
+    // ✅ create link with firmId = firmOwnerId (root), even if inviter is employee
     const link = await vendorFirmLinkModel.create({
       firmId: firmOwnerId,
       vendorCode: code,
       status: "pending",
       requestedBy: "firm",
+
+      // keep this as the *actor* (employee or root)
       requestedByUserId: userId,
+
       message: String(message || ""),
     });
 

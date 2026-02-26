@@ -46,6 +46,28 @@ function pickVendorEmail(vendor) {
   return "";
 }
 
+async function resolveCompanyNameForUser(userId) {
+  const me = await userModel
+    .findById(userId, { company: 1, firmId: 1, status: 1 })
+    .lean();
+  if (!me || Number(me.status) === 0) return "";
+
+  // prefer user's own company (works if you copy firm-root company into employees)
+  let name = String(me?.company?.name || "").trim();
+
+  // fallback: if employee has firmId and company empty, read firm root company
+  if (!name && me?.firmId) {
+    const firm = await userModel
+      .findById(me.firmId, { company: 1, status: 1 })
+      .lean();
+    if (firm && Number(firm.status) !== 0) {
+      name = String(firm?.company?.name || "").trim();
+    }
+  }
+
+  return name;
+}
+
 /**
  * ✅ UPDATED: Do NOT create vendor user here.
  * - Only fetch existing vendor user (if present) for link/token usage
@@ -61,7 +83,7 @@ const mailRFQ = async (data, user) => {
     // ✅ Only read users collection, no creation
     const vendorUser = await userModel.findOne(
       { vendorCode },
-      { _id: 1, email: 1 }
+      { _id: 1, email: 1 },
     );
 
     const emailFromUser = String(vendorUser?.email || "").trim();
@@ -71,16 +93,14 @@ const mailRFQ = async (data, user) => {
     if (!to) {
       // Don’t hard-fail whole RFQ; skip this vendor and log
       console.warn(
-        `[RFQ mail] Missing email for vendorCode=${vendorCode}. userEmail=${emailFromUser} payloadEmail=${emailFromPayload}`
+        `[RFQ mail] Missing email for vendorCode=${vendorCode}. userEmail=${emailFromUser} payloadEmail=${emailFromPayload}`,
       );
       continue;
     }
 
     // ✅ Keep same behavior: generate body with identifier
     // If vendor user exists => use userId, else fallback to vendorCode
-    const identifier = vendorUser?._id
-      ? vendorUser._id.toString()
-      : vendorCode;
+    const identifier = vendorUser?._id ? vendorUser._id.toString() : vendorCode;
 
     emailRecipients.push({
       to,
@@ -128,6 +148,9 @@ rfqRouter.post(
         data.submittedAt = new Date();
       }
 
+      const companyName = await resolveCompanyNameForUser(req.user?._id);
+      data.company = companyName;
+
       await rfqModel.create({
         ...data,
         _id: req.params.id,
@@ -156,7 +179,7 @@ rfqRouter.post(
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 rfqRouter.post("/list", async (req, res, next) => {
@@ -217,11 +240,11 @@ rfqRouter.post("/list", async (req, res, next) => {
         filter.rfqDate = {};
         if (filters.rfqDate[0])
           filter.rfqDate["$gte"] = new Date(
-            new Date(filters.rfqDate[0]).setHours(0, 0, 0, 0)
+            new Date(filters.rfqDate[0]).setHours(0, 0, 0, 0),
           );
         if (filters.rfqDate[1])
           filter.rfqDate["$lte"] = new Date(
-            new Date(filters.rfqDate[1]).setHours(24, 0, 0, 0) - 1
+            new Date(filters.rfqDate[1]).setHours(24, 0, 0, 0) - 1,
           );
       }
       if (filters.indentNumber)
@@ -330,7 +353,11 @@ rfqRouter.post("/list", async (req, res, next) => {
       ];
     }
 
-    const response = await dataTable({ ...params, matchQuery }, rfqModel, pipeline);
+    const response = await dataTable(
+      { ...params, matchQuery },
+      rfqModel,
+      pipeline,
+    );
 
     res.status(200).send(response);
   } catch (error) {
@@ -343,7 +370,9 @@ rfqRouter.get("/values", async (req, res, next) => {
     const { all } = req.query;
     let matchQuery = { status: 1 };
     if (!all) {
-      const userClinics = (await userModel.findById(req.user._id, { clinics: 1 }))?.clinics;
+      const userClinics = (
+        await userModel.findById(req.user._id, { clinics: 1 })
+      )?.clinics;
       matchQuery._id = { $in: userClinics };
     }
 
@@ -368,7 +397,10 @@ rfqRouter.put(
   async (req, res, next) => {
     try {
       const { rfqNumber, dueDate, dueDateRemarks } = req.body;
-      const rfq = await rfqModel.findOne({ rfqNumber }, { dueDate: 1, dueDateRemarks: 1 });
+      const rfq = await rfqModel.findOne(
+        { rfqNumber },
+        { dueDate: 1, dueDateRemarks: 1 },
+      );
       if (!rfq) throw createError("RFQ not found", 404);
 
       const result = await rfqModel.findByIdAndUpdate(
@@ -382,14 +414,14 @@ rfqRouter.put(
             },
           },
         },
-        { new: true }
+        { new: true },
       );
 
       res.status(200).json(result);
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 rfqRouter.get("/rfqNumber", async (req, res, next) => {
@@ -435,7 +467,7 @@ rfqRouter.get(
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 rfqRouter.get("/vendors/:id", async (req, res, next) => {
@@ -477,7 +509,8 @@ rfqRouter.get("/vendors/:id", async (req, res, next) => {
       { $set: { quotation: { $first: "$quotation" } } },
     ]);
 
-    if (!vendors?.length) throw createError("No vendors found for this RFQ", 404);
+    if (!vendors?.length)
+      throw createError("No vendors found for this RFQ", 404);
 
     for (const vendor of vendors) {
       if (!vendor.quotation) continue;
@@ -486,7 +519,9 @@ rfqRouter.get("/vendors/:id", async (req, res, next) => {
       if (!vendor.quotation.items?.length) continue;
       for (const item of vendor.quotation.items) {
         const rfqItem = vendor.items.find(
-          (i) => i.itemCode === item.itemCode && i.indentNumber === item.indentNumber
+          (i) =>
+            i.itemCode === item.itemCode &&
+            i.indentNumber === item.indentNumber,
         );
         if (!rfqItem) continue;
         item.itemDescription = rfqItem.itemDescription;
@@ -569,7 +604,7 @@ rfqRouter.get("/negotiation", async (req, res, next) => {
         "items.itemCode": 1,
         "items.rfqMake": 1,
         termsConditions: 1,
-      }
+      },
     );
     if (!rfq) throw createError("RFQ not found", 404);
     res.status(200).json(rfq);
@@ -588,7 +623,7 @@ rfqRouter.get("/:id", async (req, res, next) => {
     data.rfq = await rfqModel.findOne(
       id.length === 24
         ? { $or: [{ _id: new Types.ObjectId(id) }, { rfqNumber: id }] }
-        : { rfqNumber: id }
+        : { rfqNumber: id },
     );
 
     if (!data.rfq) throw createError("RFQ not found", 404);
@@ -598,7 +633,7 @@ rfqRouter.get("/:id", async (req, res, next) => {
       req.user?.permissions?.includes(PERMISSIONS.VENDOR_ACCESS)
     )
       data.rfq.vendors = data.rfq.vendors.filter(
-        (i) => i.vendorCode === req.user.vendorCode
+        (i) => i.vendorCode === req.user.vendorCode,
       );
 
     if (indents) {
@@ -633,10 +668,12 @@ rfqRouter.put(
         data.submittedAt = new Date();
       }
 
+      data.company = await resolveCompanyNameForUser(req.user?._id)
+
       const updatedRFQ = await rfqModel.findByIdAndUpdate(
         req.params.id,
         { $set: data },
-        { new: true }
+        { new: true },
       );
       if (!updatedRFQ) throw createError("RFQ not found", 404);
 
@@ -662,7 +699,7 @@ rfqRouter.put(
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 rfqRouter.patch(
@@ -686,7 +723,7 @@ rfqRouter.patch(
       try {
         await mailRFQ(
           { ...rfq.toObject(), vendors: [vendor], dueDate: rfq.dueDate },
-          req.user._id
+          req.user._id,
         );
       } catch (error) {
         errorMessage = "Vendor added but failed to send rfq email.";
@@ -696,7 +733,7 @@ rfqRouter.patch(
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 rfqRouter.patch(
@@ -729,7 +766,7 @@ rfqRouter.patch(
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 rfqRouter.delete(
@@ -750,7 +787,7 @@ rfqRouter.delete(
       if (recordsExists)
         throw createError(
           recordsExists + " quotations have been submitted for this RFQ.",
-          400
+          400,
         );
       else {
         await rfqModel.findByIdAndDelete(req.params.id);
@@ -771,7 +808,7 @@ rfqRouter.delete(
     } catch (error) {
       next(error);
     }
-  }
+  },
 );
 
 export default rfqRouter;

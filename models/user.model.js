@@ -103,7 +103,7 @@ const userSchema = new Schema(
      */
     name: { type: String, required: true, trim: true },
 
-    role: { type: Types.ObjectId, ref: "roles", default: null },
+    role: { type: Types.ObjectId, ref: "role", default: null },
 
     /**
      * ✅ Firm company details

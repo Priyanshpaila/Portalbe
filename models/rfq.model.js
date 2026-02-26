@@ -3,6 +3,7 @@ import mongoose, { Schema, Types, model } from "mongoose"
 const rfqSchema = new Schema(
 	{
 		rfqNumber: { type: String, required: true, unique: true },
+		company: { type: String, trim: true},
 		rfqDate: { type: Date },
 		dueDate: { type: Date },
 		dueDateRemarks: { type: String },

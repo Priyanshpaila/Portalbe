@@ -10,6 +10,7 @@ const csModel = new Schema(
 		csType: { type: String, enum: ["item_wise", "over_all"] },
 		rfqNumber: { type: String },
 		rfqDate: { type: Date },
+		company: { type: String, default: "", index: true },
 		authorizedBy: { type: Types.ObjectId, ref: "users" },
 		authorizedAt: { type: Date },
 		status: { type: Number, default: 0, enum: [0, 1, 2] },

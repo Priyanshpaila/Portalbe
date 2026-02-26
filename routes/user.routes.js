@@ -543,22 +543,69 @@ userRouter.get("/me", async (req, res, next) => {
  * ✅ GET /users/me-or-all
  * (moved ABOVE "/:id" to avoid route collision)
  */
+function toObjectIdMaybe(v) {
+  if (!v) return null;
+  if (v instanceof mongoose.Types.ObjectId) return v;
+  if (mongoose.isValidObjectId(String(v)))
+    return new mongoose.Types.ObjectId(String(v));
+  return null;
+}
+
+async function resolveCompanyForUser(u) {
+  const companyName = String(u?.company?.name || "").trim();
+  if (companyName) return u.company;
+
+  const firmId = toObjectIdMaybe(u?.firmId);
+  if (!firmId) return u?.company || {};
+
+  const firmRoot = await User.findById(firmId, {
+    company: 1,
+    status: 1,
+    vendorCode: 1,
+  }).lean();
+  if (!firmRoot) return u?.company || {};
+  if (Number(firmRoot.status) === 0) return u?.company || {};
+  if (firmRoot.vendorCode) return u?.company || {}; // don't treat vendor as firm
+
+  return firmRoot.company || u?.company || {};
+}
+
+// ✅ GET /users/me-or-all
 userRouter.get("/me-or-all", async (req, res, next) => {
   try {
-    const me = await User.findById(req.user._id).populate("role", "name");
+    const me = await User.findById(req.user._id).lean();
     if (!me) throw createError("User not found", 404);
 
-    const roleName = String(me?.role?.name || "").toLowerCase();
-    const isAdmin = roleName === "admin";
+    const roleId = toObjectIdMaybe(me.role);
 
+    // ✅ FIX: use roleModel
+    const roleDoc = roleId
+      ? await roleModel.findById(roleId, { name: 1 }).lean()
+      : null;
+
+    const roleName = String(roleDoc?.name || "").toLowerCase();
+    const isAdmin = roleName === "superadmin";
+
+    const stripPassword = (u) => {
+      if (!u) return u;
+      const { password, ...rest } = u;
+      return rest;
+    };
+
+    // ✅ non-admin => return only self (with resolved firm-root company)
     if (!isAdmin) {
-      const self = await User.findById(req.user._id, { password: 0 }).populate(
-        "role",
-        "name",
-      );
-      return res.status(200).json([self]);
+      const company = await resolveCompanyForUser(me);
+
+      return res.status(200).json([
+        {
+          ...stripPassword(me),
+          company,
+          role: roleDoc ? { _id: roleDoc._id, name: roleDoc.name } : me.role,
+        },
+      ]);
     }
 
+    // ✅ admin => return all users
     const users = await User.aggregate([
       {
         $lookup: {
@@ -580,7 +627,7 @@ userRouter.get("/me-or-all", async (req, res, next) => {
       },
       {
         $set: {
-          role: { $first: "$role.name" },
+          role: { $first: "$role" }, // { _id, name }
           createdBy: { $first: "$createdBy.name" },
         },
       },
@@ -982,7 +1029,8 @@ userRouter.post("/firm/employees", async (req, res, next) => {
   try {
     const me = await getMe(req);
     if (!me) throw createError("User not found", 404);
-    if (!isFirmRoot(me)) throw createError("Only firm root can create employees", 403);
+    if (!isFirmRoot(me))
+      throw createError("Only firm root can create employees", 403);
 
     const { username, password, name, email, role } = req.body || {};
     if (!username || !password || !name) {
@@ -990,7 +1038,8 @@ userRouter.post("/firm/employees", async (req, res, next) => {
     }
 
     const activeSub = await getActiveSubscription(me._id);
-    if (!activeSub) throw createError("Active subscription required to add employees", 402);
+    if (!activeSub)
+      throw createError("Active subscription required to add employees", 402);
 
     const seatsAllowed = Number(activeSub?.notes?.seats || 0);
     if (seatsAllowed > 0) {
@@ -1018,13 +1067,13 @@ userRouter.post("/firm/employees", async (req, res, next) => {
       pincode: String(c?.pincode || "").trim(),
     });
 
-    const companySnapshot = normalizeCompany((me)?.company);
+    const companySnapshot = normalizeCompany(me?.company);
 
     const hashedPassword = await hashAsync(String(password), 10);
 
     const employee = await User.create({
-      _id: new Types.ObjectId(),              // ✅ keep as ObjectId
-      firmId: me._id,                         // firm owner id
+      _id: new Types.ObjectId(), // ✅ keep as ObjectId
+      firmId: me._id, // firm owner id
       username: String(username).trim(),
       password: hashedPassword,
       passwordStatus: "temporary",

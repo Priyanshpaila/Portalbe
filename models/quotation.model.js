@@ -13,6 +13,7 @@ export const ChargeSchema = new Schema(
 
 export const quotationSchema = new Schema(
 	{
+		company: { type: String, trim: true},
 		validityDate: { type: Date },
 		quotationNumber: { type: String, required: true, unique: true },
 		quotationDate: { type: Date, required: true, default: Date.now },

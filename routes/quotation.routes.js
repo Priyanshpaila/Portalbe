@@ -12,6 +12,7 @@ import poModel from "../models/po.model.js"
 import fs from "fs/promises"
 import negotiationModel from "../models/negotiation.model.js"
 import rfqModel from "../models/rfq.model.js"
+import indentModel from "../models/indent.model.js" // ✅ NEW
 
 const isPoGenerated = async (params) => {
 	const quotation = typeof params === "string" ? await quotationModel.findById(params) : params
@@ -36,10 +37,55 @@ const isPoGenerated = async (params) => {
 	return po?.poNumber
 }
 
+/* =========================================================
+   ✅ NEW helper: resolve company from indent items
+   ========================================================= */
+async function resolveCompanyFromQuotationItems(items = []) {
+	try {
+		const pairs = []
+
+		for (const it of items || []) {
+			const indentNumber = String(it?.indentNumber || "").trim()
+			const itemCode = String(it?.itemCode || "").trim()
+			if (!indentNumber) continue
+
+			// Prefer matching both indentNumber + itemCode
+			if (itemCode) pairs.push({ indentNumber, itemCode })
+			else pairs.push({ indentNumber })
+		}
+
+		if (!pairs.length) return ""
+
+		const rows = await indentModel
+			.find(
+				{ $or: pairs },
+				{ company: 1, indentNumber: 1, itemCode: 1 }
+			)
+			.lean()
+
+		const companies = [...new Set((rows || [])
+			.map((r) => String(r?.company || "").trim())
+			.filter(Boolean))]
+
+		if (!companies.length) return ""
+
+		// If multiple companies found, keep first (usually shouldn't happen)
+		if (companies.length > 1) {
+			console.warn("[quotation.company] Multiple companies found from items:", companies)
+		}
+
+		return companies[0] || ""
+	} catch (e) {
+		console.error("[quotation.company] resolveCompanyFromQuotationItems failed:", e)
+		return ""
+	}
+}
+
 const quotationRouter = express.Router()
 
 quotationRouter.post(
 	"/",
+	authorizeTokens,
 	authorizePermissions(PERMISSIONS.VENDOR_ACCESS),
 	(req, res, next) => {
 		req.params.id = new Types.ObjectId().toString()
@@ -49,8 +95,12 @@ quotationRouter.post(
 	async (req, res, next) => {
 		try {
 			const data = JSON.parse(req.body.data)
+
 			if (await quotationModel.findOne({ quotationNumber: data.quotationNumber }))
 				throw createError("Quotation number already used.", 400)
+
+			// ✅ AUTO-SET COMPANY FROM INDENTS
+			data.company = await resolveCompanyFromQuotationItems(data?.items || [])
 
 			await quotationModel.create({
 				...data,
@@ -74,6 +124,7 @@ quotationRouter.post(
 
 quotationRouter.put(
 	"/:id",
+	authorizeTokens,
 	authorizePermissions(PERMISSIONS.VENDOR_ACCESS),
 	upload.array("file"),
 	async (req, res, next) => {
@@ -92,9 +143,8 @@ quotationRouter.put(
 			)
 				throw createError("Quotation number already used.", 400)
 
-			// if (files && files.length > 0) {
-			// 	updatedData.attachments = [...(updatedData.attachments || []), ...files]
-			// }
+			// ✅ AUTO-SET COMPANY FROM INDENTS (on update too)
+			updatedData.company = await resolveCompanyFromQuotationItems(updatedData?.items || [])
 
 			const updatedQuotation = await quotationModel.findByIdAndUpdate(
 				req.params.id,
@@ -120,7 +170,7 @@ quotationRouter.put(
 	}
 )
 
-quotationRouter.post("/list", async (req, res, next) => {
+quotationRouter.post("/list", authorizeTokens, async (req, res, next) => {
 	try {
 		const { query, filters, ...params } = req.body
 		const matchQuery = []
@@ -160,6 +210,7 @@ quotationRouter.post("/list", async (req, res, next) => {
 
 		if (filters) {
 			const filter = {}
+
 			if (req.user.vendorCode) {
 				if (filters.status === "initial") filter.status = 0
 				if (filters.status === "authorized") filter.status = 1
@@ -187,6 +238,9 @@ quotationRouter.post("/list", async (req, res, next) => {
 			if (filters.itemCode) filter["items.itemCode"] = filters.itemCode.trim()
 			if (filters.itemDescription) filter["items.itemDescription"] = filters.itemDescription.trim()
 
+			// ✅ NEW: company filter
+			if (filters.company) filter.company = String(filters.company).trim()
+
 			if (Object.keys(filter).length) matchQuery.push({ $match: filter })
 		}
 
@@ -197,7 +251,7 @@ quotationRouter.post("/list", async (req, res, next) => {
 	}
 })
 
-quotationRouter.get("/values", async (req, res, next) => {
+quotationRouter.get("/values", authorizeTokens, async (req, res, next) => {
 	try {
 		const { all } = req.query
 		let matchQuery = { status: 1 }
@@ -223,7 +277,7 @@ quotationRouter.get("/values", async (req, res, next) => {
 	}
 })
 
-quotationRouter.get("/items/:id", async (req, res, next) => {
+quotationRouter.get("/items/:id", authorizeTokens, async (req, res, next) => {
 	try {
 		const quotation = req.query.appendRFQDetails
 			? (
@@ -280,6 +334,7 @@ quotationRouter.get("/items/:id", async (req, res, next) => {
 					])
 			  )?.[0]
 			: await quotationModel.findById(req.params.id, { items: 1 })
+
 		if (!quotation) throw createError("Quotation not found", 404)
 
 		res.status(200).json(quotation.items)
@@ -288,7 +343,7 @@ quotationRouter.get("/items/:id", async (req, res, next) => {
 	}
 })
 
-quotationRouter.get("/attachments/:id", async (req, res, next) => {
+quotationRouter.get("/attachments/:id", authorizeTokens, async (req, res, next) => {
 	try {
 		const rfq = await quotationModel.findById(req.params.id, { attachments: 1 })
 		if (!rfq) throw createError("Quotation not found", 404)
@@ -298,7 +353,7 @@ quotationRouter.get("/attachments/:id", async (req, res, next) => {
 	}
 })
 
-quotationRouter.get("/rfq/:rfqNumber", async (req, res, next) => {
+quotationRouter.get("/rfq/:rfqNumber", authorizeTokens, async (req, res, next) => {
 	try {
 		const { rfqNumber } = req.params
 		const rfqs = await quotationModel.findById(rfqNumber)
@@ -309,7 +364,7 @@ quotationRouter.get("/rfq/:rfqNumber", async (req, res, next) => {
 	}
 })
 
-quotationRouter.get("/", async (req, res, next) => {
+quotationRouter.get("/", authorizeTokens, async (req, res, next) => {
 	try {
 		const { quotationNumber, fetchNegotiation } = req.query
 		const quotation = (await quotationModel.findOne({ quotationNumber }))?.toJSON()

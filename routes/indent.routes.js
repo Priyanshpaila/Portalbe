@@ -8,6 +8,7 @@ import { syncIndentQuantity } from "../helpers/syncIndentQuantity.js";
 import { dataTable } from "../helpers/dataTable.js";
 import { randomUUID } from "crypto";
 import mongoose from "mongoose";
+import userModel from "../models/user.model.js";
 
 const indentRouter = express.Router();
 
@@ -20,7 +21,12 @@ function pad(num, len) {
 
 const COUNTERS = {
   ITEM_CODE: { id: "itemCode", prefix: "IC", padLen: 8, field: "itemCode" },
-  INDENT_NO: { id: "indentNumber", prefix: "IN", padLen: 8, field: "indentNumber" },
+  INDENT_NO: {
+    id: "indentNumber",
+    prefix: "IN",
+    padLen: 8,
+    field: "indentNumber",
+  },
   LINE_NO: { id: "lineNumber", prefix: "", padLen: 5, field: "lineNumber" }, // numeric only
 };
 
@@ -77,7 +83,7 @@ async function ensureCounterInitialized(counterKey) {
     await counterModel.findOneAndUpdate(
       { _id: cfg.id },
       { $max: { seq: maxSeq } },
-      { upsert: true, new: true }
+      { upsert: true, new: true },
     );
   })();
 
@@ -93,7 +99,7 @@ async function nextCode(counterKey) {
   const counter = await counterModel.findOneAndUpdate(
     { _id: cfg.id },
     { $inc: { seq: 1 } },
-    { new: true, upsert: true }
+    { new: true, upsert: true },
   );
 
   const seq = Number(counter?.seq || 1);
@@ -119,7 +125,9 @@ function normalizeIndentNumber(v) {
   return "";
 }
 function normalizeLineNumber(v) {
-  const raw = String(v ?? "").replace(/\D/g, "").slice(0, 5);
+  const raw = String(v ?? "")
+    .replace(/\D/g, "")
+    .slice(0, 5);
   if (!raw) return "";
   return pad(parseInt(raw, 10) || 0, 5);
 }
@@ -222,15 +230,21 @@ indentRouter.post("/register", async (req, res, next) => {
       else if (filters.status === "completed") filter.balanceQty = 0;
 
       if (filters.company?.length) filter.company = { $in: filters.company };
-      if (filters.indentNumber) filter.indentNumber = filters.indentNumber.trim();
+      if (filters.indentNumber)
+        filter.indentNumber = filters.indentNumber.trim();
       if (filters.itemCode) filter.itemCode = filters.itemCode.trim();
-      if (filters.itemDescription) filter.itemDescription = filters.itemDescription.trim();
+      if (filters.itemDescription)
+        filter.itemDescription = filters.itemDescription.trim();
       if (filters.documentDate?.[0]) {
         filter.documentDate = {};
         if (filters.documentDate[0])
-          filter.documentDate["$gte"] = new Date(new Date(filters.documentDate[0]).setHours(0, 0, 0, 0));
+          filter.documentDate["$gte"] = new Date(
+            new Date(filters.documentDate[0]).setHours(0, 0, 0, 0),
+          );
         if (filters.documentDate[1])
-          filter.documentDate["$lte"] = new Date(new Date(filters.documentDate[1]).setHours(24, 0, 0, 0) - 1);
+          filter.documentDate["$lte"] = new Date(
+            new Date(filters.documentDate[1]).setHours(24, 0, 0, 0) - 1,
+          );
       }
 
       if (Object.keys(filter).length) matchQuery.push({ $match: filter });
@@ -304,7 +318,7 @@ indentRouter.post("/register", async (req, res, next) => {
         sapPONumber: 1,
         refCSNumber: 1,
         refCSDate: 1,
-      }
+      },
     );
 
     const fields = {};
@@ -352,7 +366,7 @@ indentRouter.post("/register", async (req, res, next) => {
           const pos = poDetails[key]?.filter(
             (i) =>
               i.quotationNumber === csDetails.quotationNumber ||
-              i.csNumber === cs.csNumber
+              i.csNumber === cs.csNumber,
           );
 
           if (pos?.length > 0)
@@ -381,7 +395,7 @@ indentRouter.post("/register", async (req, res, next) => {
 
         if (poDetails[key]?.length) {
           poDetails[key] = poDetails[key]?.filter(
-            (po) => !po.quotationNumber && !po.csNumber
+            (po) => !po.quotationNumber && !po.csNumber,
           );
           if (!poDetails[key]?.length) delete poDetails[key];
           else {
@@ -404,15 +418,43 @@ indentRouter.post("/register", async (req, res, next) => {
  * ✅ Add new item (Backend ALWAYS generates itemCode, indentNumber, lineNumber)
  * Frontend should NOT send them.
  */
+
 indentRouter.post("/add-item", async (req, res, next) => {
   try {
     const itemDescription = String(req.body?.itemDescription ?? "").trim();
     const techSpec = String(req.body?.techSpec ?? "").trim();
     const make = String(req.body?.make ?? "").trim();
-    const unitOfMeasure = String(req.body?.unitOfMeasure ?? req.body?.unit ?? "").trim();
+    const unitOfMeasure = String(
+      req.body?.unitOfMeasure ?? req.body?.unit ?? "",
+    ).trim();
 
-    if (!itemDescription) return res.status(400).json({ message: "itemDescription is required" });
-    if (!unitOfMeasure) return res.status(400).json({ message: "unitOfMeasure is required" });
+    const hsnCode = String(req.body?.hsnCode ?? req.body?.hsncode ?? "").trim();
+
+    // ✅ NEW: resolve company (prefer server-truth)
+    let company = String(req.body?.company ?? "").trim();
+
+    if (!company) {
+      // from token user (if your auth middleware attaches full user)
+      company = String(req.user?.company?.name ?? "").trim();
+    }
+
+    if (!company) {
+      // fallback: if firm employee, pull firm root company
+      const firmId = req.user?.firmId;
+      if (firmId && mongoose.isValidObjectId(String(firmId))) {
+        const firmRoot = await userModel
+          .findById(firmId, { company: 1 })
+          .lean();
+        company = String(firmRoot?.company?.name ?? "").trim();
+      }
+    }
+
+    if (!itemDescription)
+      return res.status(400).json({ message: "itemDescription is required" });
+    if (!unitOfMeasure)
+      return res.status(400).json({ message: "unitOfMeasure is required" });
+    if (!company)
+      return res.status(400).json({ message: "company is required" }); // ✅ NEW
 
     const now = new Date();
 
@@ -425,7 +467,9 @@ indentRouter.post("/add-item", async (req, res, next) => {
       const lineNumberToUse = await nextCode("LINE_NO");
 
       if (!itemCodeToUse) {
-        return res.status(500).json({ success: false, message: "Failed to generate itemCode" });
+        return res
+          .status(500)
+          .json({ success: false, message: "Failed to generate itemCode" });
       }
 
       try {
@@ -441,6 +485,9 @@ indentRouter.post("/add-item", async (req, res, next) => {
           techSpec,
           make,
           unitOfMeasure,
+
+          company,
+          hsnCode,
 
           createdOn: now,
           lastChangedOn: now,
@@ -477,7 +524,7 @@ indentRouter.get("/items", async (req, res, next) => {
     const page = Math.max(parseInt(String(req.query.page ?? "1"), 10) || 1, 1);
     const pageSize = Math.min(
       Math.max(parseInt(String(req.query.pageSize ?? "50"), 10) || 50, 1),
-      200
+      200,
     );
 
     const filter = { documentCategory: "ITEM_MASTER" };
@@ -489,6 +536,8 @@ indentRouter.get("/items", async (req, res, next) => {
         { make: { $regex: q, $options: "i" } },
         { techSpec: { $regex: q, $options: "i" } },
         { unitOfMeasure: { $regex: q, $options: "i" } },
+        { company: { $regex: q, $options: "i" } },
+        { hsnCode: { $regex: q, $options: "i" } },
       ];
     }
 
@@ -527,7 +576,7 @@ function pickAllowedItemMasterUpdates(body) {
     "techSpec",
     "make",
     "unitOfMeasure",
-
+    "hsnCode",
     "company",
     "costCenter",
     "remark",
@@ -585,8 +634,10 @@ indentRouter.put("/add-item/:id", async (req, res, next) => {
     delete updates.documentCategory;
     delete updates.createdOn;
 
-    if (updates.documentDate) updates.documentDate = new Date(updates.documentDate);
-    if (updates.utcTimestamp) updates.utcTimestamp = new Date(updates.utcTimestamp);
+    if (updates.documentDate)
+      updates.documentDate = new Date(updates.documentDate);
+    if (updates.utcTimestamp)
+      updates.utcTimestamp = new Date(updates.utcTimestamp);
 
     // if client explicitly sent indentNumber/lineNumber, normalize or auto-generate
     if (Object.prototype.hasOwnProperty.call(updates, "indentNumber")) {
@@ -603,10 +654,16 @@ indentRouter.put("/add-item/:id", async (req, res, next) => {
     const qtyUpdates = {};
 
     for (const k of qtyKeys) {
-      if (req.body?.[k] !== undefined && req.body?.[k] !== null && req.body?.[k] !== "") {
+      if (
+        req.body?.[k] !== undefined &&
+        req.body?.[k] !== null &&
+        req.body?.[k] !== ""
+      ) {
         const n = Number(req.body[k]);
         if (!Number.isFinite(n) || n < 0) {
-          return res.status(400).json({ message: `${k} must be a non-negative number` });
+          return res
+            .status(400)
+            .json({ message: `${k} must be a non-negative number` });
         }
         qtyUpdates[k] = n;
       }
@@ -626,11 +683,16 @@ indentRouter.put("/add-item/:id", async (req, res, next) => {
       });
     }
 
-    const finalIndentQty = qtyUpdates.indentQty ?? Number(existing.indentQty || 0);
-    const finalPreRFQQty = qtyUpdates.preRFQQty ?? Number(existing.preRFQQty || 0);
+    const finalIndentQty =
+      qtyUpdates.indentQty ?? Number(existing.indentQty || 0);
+    const finalPreRFQQty =
+      qtyUpdates.preRFQQty ?? Number(existing.preRFQQty || 0);
     const finalPrePOQty = qtyUpdates.prePOQty ?? Number(existing.prePOQty || 0);
 
-    const computedBalanceQty = Math.max(0, finalIndentQty - finalPreRFQQty - finalPrePOQty);
+    const computedBalanceQty = Math.max(
+      0,
+      finalIndentQty - finalPreRFQQty - finalPrePOQty,
+    );
 
     const finalSet = {
       ...updates,
@@ -642,7 +704,7 @@ indentRouter.put("/add-item/:id", async (req, res, next) => {
     const doc = await indentModel.findOneAndUpdate(
       { ...match, documentCategory: "ITEM_MASTER" },
       { $set: finalSet },
-      { new: true, runValidators: true }
+      { new: true, runValidators: true },
     );
 
     return res.status(200).json({ success: true, data: doc });
@@ -666,7 +728,9 @@ indentRouter.get("/last-item-code", async (req, res, next) => {
 indentRouter.get("/last-indent-number", async (req, res, next) => {
   try {
     const lastindentNumber = await currentCode("INDENT_NO");
-    return res.status(200).json({ lastindentNumber: lastindentNumber || "IN00000000" });
+    return res
+      .status(200)
+      .json({ lastindentNumber: lastindentNumber || "IN00000000" });
   } catch (e) {
     next(e);
   }

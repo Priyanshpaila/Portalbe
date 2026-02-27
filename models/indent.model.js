@@ -6,6 +6,8 @@ const indentSchema = new Schema({
   itemCode: { type: String },
   itemDescription: { type: String },
 
+  hsnCode: { type: String, trim: true, default: "" },
+
   company: { type: String },
   costCenter: { type: String },
   remark: { type: String },

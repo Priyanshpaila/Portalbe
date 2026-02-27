@@ -1,419 +1,490 @@
-import express from "express"
-import quotationModel from "../models/quotation.model.js"
-import { createError } from "../lib/customError.js"
-import { dataTable } from "../helpers/dataTable.js"
-import userModel from "../models/user.model.js"
-import { Types } from "mongoose"
-import upload from "../middlewares/upload.middleware.js"
-import { authorizePermissions, authorizeTokens } from "../middlewares/auth.middleware.js"
-import { PERMISSIONS } from "../lib/permissions.js"
-import csModel from "../models/cs.model.js"
-import poModel from "../models/po.model.js"
-import fs from "fs/promises"
-import negotiationModel from "../models/negotiation.model.js"
-import rfqModel from "../models/rfq.model.js"
-import indentModel from "../models/indent.model.js" // ✅ NEW
+import express from "express";
+import quotationModel from "../models/quotation.model.js";
+import { createError } from "../lib/customError.js";
+import { dataTable } from "../helpers/dataTable.js";
+import userModel from "../models/user.model.js";
+import { Types } from "mongoose";
+import upload from "../middlewares/upload.middleware.js";
+import {
+  authorizePermissions,
+  authorizeTokens,
+} from "../middlewares/auth.middleware.js";
+import { PERMISSIONS } from "../lib/permissions.js";
+import csModel from "../models/cs.model.js";
+import poModel from "../models/po.model.js";
+import fs from "fs/promises";
+import negotiationModel from "../models/negotiation.model.js";
+import rfqModel from "../models/rfq.model.js";
+import indentModel from "../models/indent.model.js"; // ✅ NEW
 
 const isPoGenerated = async (params) => {
-	const quotation = typeof params === "string" ? await quotationModel.findById(params) : params
-	if (!quotation) throw createError("Quotation not found", 404)
+  const quotation =
+    typeof params === "string" ? await quotationModel.findById(params) : params;
+  if (!quotation) throw createError("Quotation not found", 404);
 
-	const cs = await csModel.findOne(
-		{
-			$and: [{ rfqNumber: quotation.rfqNumber }, { "selection.quotationNumber": quotation.quotationNumber }]
-		},
-		{ csNumber: 1 }
-	)
+  const cs = await csModel.findOne(
+    {
+      $and: [
+        { rfqNumber: quotation.rfqNumber },
+        { "selection.quotationNumber": quotation.quotationNumber },
+      ],
+    },
+    { csNumber: 1 },
+  );
 
-	const po = await poModel.findOne(
-		cs?.csNumber
-			? {
-					$or: [{ refDocumentNumber: quotation.quotationNumber }, { "items.csNumber": cs?.csNumber }]
-			  }
-			: { refDocumentNumber: quotation.quotationNumber },
-		{ poNumber: 1 }
-	)
+  const po = await poModel.findOne(
+    cs?.csNumber
+      ? {
+          $or: [
+            { refDocumentNumber: quotation.quotationNumber },
+            { "items.csNumber": cs?.csNumber },
+          ],
+        }
+      : { refDocumentNumber: quotation.quotationNumber },
+    { poNumber: 1 },
+  );
 
-	return po?.poNumber
-}
+  return po?.poNumber;
+};
 
 /* =========================================================
    ✅ NEW helper: resolve company from indent items
    ========================================================= */
 async function resolveCompanyFromQuotationItems(items = []) {
-	try {
-		const pairs = []
+  try {
+    const cleaned = (items || [])
+      .map((it) => ({
+        indentNumber: String(it?.indentNumber || "").trim(),
+        itemCode: String(it?.itemCode || "").trim(),
+      }))
+      .filter((x) => x.indentNumber);
 
-		for (const it of items || []) {
-			const indentNumber = String(it?.indentNumber || "").trim()
-			const itemCode = String(it?.itemCode || "").trim()
-			if (!indentNumber) continue
+    if (!cleaned.length) return "";
 
-			// Prefer matching both indentNumber + itemCode
-			if (itemCode) pairs.push({ indentNumber, itemCode })
-			else pairs.push({ indentNumber })
-		}
+    // 1) exact match using first item
+    const first = cleaned[0];
+    const exact = await indentModel
+      .findOne(
+        {
+          indentNumber: first.indentNumber,
+          ...(first.itemCode ? { itemCode: first.itemCode } : {}),
+        },
+        { company: 1 },
+      )
+      .lean();
 
-		if (!pairs.length) return ""
+    const exactCompany = String(exact?.company || "").trim();
+    if (exactCompany) return exactCompany;
 
-		const rows = await indentModel
-			.find(
-				{ $or: pairs },
-				{ company: 1, indentNumber: 1, itemCode: 1 }
-			)
-			.lean()
+    // 2) fallback: match by indentNumber only (safer if itemCode mismatch)
+    const indentNumbers = [...new Set(cleaned.map((x) => x.indentNumber))];
 
-		const companies = [...new Set((rows || [])
-			.map((r) => String(r?.company || "").trim())
-			.filter(Boolean))]
+    const row = await indentModel
+      .findOne(
+        { indentNumber: { $in: indentNumbers }, company: { $ne: "" } },
+        { company: 1 },
+      )
+      .lean();
 
-		if (!companies.length) return ""
-
-		// If multiple companies found, keep first (usually shouldn't happen)
-		if (companies.length > 1) {
-			console.warn("[quotation.company] Multiple companies found from items:", companies)
-		}
-
-		return companies[0] || ""
-	} catch (e) {
-		console.error("[quotation.company] resolveCompanyFromQuotationItems failed:", e)
-		return ""
-	}
+    return String(row?.company || "").trim();
+  } catch (e) {
+    console.error("[quotation.company] resolve failed:", e);
+    return "";
+  }
 }
 
-const quotationRouter = express.Router()
+const quotationRouter = express.Router();
 
 quotationRouter.post(
-	"/",
-	authorizeTokens,
-	authorizePermissions(PERMISSIONS.VENDOR_ACCESS),
-	(req, res, next) => {
-		req.params.id = new Types.ObjectId().toString()
-		next()
-	},
-	upload.array("file"),
-	async (req, res, next) => {
-		try {
-			const data = JSON.parse(req.body.data)
+  "/",
+  authorizeTokens,
+  authorizePermissions(PERMISSIONS.VENDOR_ACCESS),
+  (req, res, next) => {
+    req.params.id = new Types.ObjectId().toString();
+    next();
+  },
+  upload.array("file"),
+  async (req, res, next) => {
+    try {
+      const data = JSON.parse(req.body.data);
 
-			if (await quotationModel.findOne({ quotationNumber: data.quotationNumber }))
-				throw createError("Quotation number already used.", 400)
+      if (
+        await quotationModel.findOne({ quotationNumber: data.quotationNumber })
+      )
+        throw createError("Quotation number already used.", 400);
 
-			// ✅ AUTO-SET COMPANY FROM INDENTS
-			data.company = await resolveCompanyFromQuotationItems(data?.items || [])
+      const resolvedCompany = await resolveCompanyFromQuotationItems(
+        data?.items || [],
+      );
+      console.log("[quotation] resolvedCompany:", resolvedCompany);
 
-			await quotationModel.create({
-				...data,
-				_id: req.params.id,
-				createdBy: req.user?._id
-			})
+      await quotationModel.create({
+        ...data,
+        _id: req.params.id,
+        createdBy: req.user?._id,
+        company: resolvedCompany || "",
+      });
 
-			if (data.status === 1)
-				await rfqModel.findOneAndUpdate(
-					{ rfqNumber: data.rfqNumber },
-					{ $set: { "vendors.$[vendor].status": data.status } },
-					{ arrayFilters: [{ "vendor.vendorCode": data.vendorCode }] }
-				)
+      if (data.status === 1)
+        await rfqModel.findOneAndUpdate(
+          { rfqNumber: data.rfqNumber },
+          { $set: { "vendors.$[vendor].status": data.status } },
+          { arrayFilters: [{ "vendor.vendorCode": data.vendorCode }] },
+        );
 
-			res.status(201).json({ success: true })
-		} catch (error) {
-			next(error)
-		}
-	}
-)
+      res.status(201).json({ success: true });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 quotationRouter.put(
-	"/:id",
-	authorizeTokens,
-	authorizePermissions(PERMISSIONS.VENDOR_ACCESS),
-	upload.array("file"),
-	async (req, res, next) => {
-		try {
-			const poNumber = await isPoGenerated(req.params.id)
-			if (poNumber)
-				throw createError(`Cannot delete! Order '${poNumber}' has been generated from this quotation.`, 400)
+  "/:id",
+  authorizeTokens,
+  authorizePermissions(PERMISSIONS.VENDOR_ACCESS),
+  upload.array("file"),
+  async (req, res, next) => {
+    try {
+      const poNumber = await isPoGenerated(req.params.id);
+      if (poNumber)
+        throw createError(
+          `Cannot delete! Order '${poNumber}' has been generated from this quotation.`,
+          400,
+        );
 
-			const updatedData = JSON.parse(req.body.data)
+      const updatedData = JSON.parse(req.body.data);
 
-			if (
-				await quotationModel.findOne({
-					quotationNumber: updatedData.quotationNumber,
-					_id: { $ne: req.params.id }
-				})
-			)
-				throw createError("Quotation number already used.", 400)
+      const resolvedCompany = await resolveCompanyFromQuotationItems(
+        updatedData?.items || [],
+      );
+      console.log("[quotation] resolvedCompany(update):", resolvedCompany);
 
-			// ✅ AUTO-SET COMPANY FROM INDENTS (on update too)
-			updatedData.company = await resolveCompanyFromQuotationItems(updatedData?.items || [])
+      if (
+        await quotationModel.findOne({
+          quotationNumber: updatedData.quotationNumber,
+          _id: { $ne: req.params.id },
+        })
+      )
+        throw createError("Quotation number already used.", 400);
 
-			const updatedQuotation = await quotationModel.findByIdAndUpdate(
-				req.params.id,
-				{ $set: updatedData },
-				{ new: true, runValidators: true }
-			)
+      // ✅ AUTO-SET COMPANY FROM INDENTS (on update too)
+      updatedData.company = await resolveCompanyFromQuotationItems(
+        updatedData?.items || [],
+      );
 
-			if (!updatedQuotation) {
-				return res.status(404).json({ success: false, message: "Quotation not found" })
-			}
+      const updatedQuotation = await quotationModel.findByIdAndUpdate(
+        req.params.id,
+        { $set: { ...updatedData, company: resolvedCompany || "" } },
+        { new: true, runValidators: true },
+      );
 
-			if (updatedQuotation.status === 1)
-				await rfqModel.findOneAndUpdate(
-					{ rfqNumber: updatedQuotation.rfqNumber },
-					{ $set: { "vendors.$[vendor].status": updatedQuotation.status } },
-					{ arrayFilters: [{ "vendor.vendorCode": updatedQuotation.vendorCode }] }
-				)
+      if (!updatedQuotation) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Quotation not found" });
+      }
 
-			res.status(200).json({ success: true, data: updatedQuotation })
-		} catch (error) {
-			next(error)
-		}
-	}
-)
+      if (updatedQuotation.status === 1)
+        await rfqModel.findOneAndUpdate(
+          { rfqNumber: updatedQuotation.rfqNumber },
+          { $set: { "vendors.$[vendor].status": updatedQuotation.status } },
+          {
+            arrayFilters: [
+              { "vendor.vendorCode": updatedQuotation.vendorCode },
+            ],
+          },
+        );
+
+      res.status(200).json({ success: true, data: updatedQuotation });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 quotationRouter.post("/list", authorizeTokens, async (req, res, next) => {
-	try {
-		const { query, filters, ...params } = req.body
-		const matchQuery = []
+  try {
+    const { query, filters, ...params } = req.body;
+    const matchQuery = [];
 
-		let pipeline = [
-			{
-				$lookup: {
-					from: "vendors",
-					localField: "vendorCode",
-					foreignField: "vendorCode",
-					as: "vendorName"
-				}
-			},
-			{
-				$set: {
-					vendorName: {
-						$first: "$vendorName.name"
-					}
-				}
-			}
-		]
+    let pipeline = [
+      {
+        $lookup: {
+          from: "vendors",
+          localField: "vendorCode",
+          foreignField: "vendorCode",
+          as: "vendorName",
+        },
+      },
+      {
+        $set: {
+          vendorName: {
+            $first: "$vendorName.name",
+          },
+        },
+      },
+    ];
 
-		if (req.user.vendorCode)
-			matchQuery.push({
-				$match: {
-					vendorCode: req.user.vendorCode
-				}
-			})
-		else
-			matchQuery.push({
-				$match: {
-					status: {
-						$gt: 0
-					}
-				}
-			})
+    if (req.user.vendorCode)
+      matchQuery.push({
+        $match: {
+          vendorCode: req.user.vendorCode,
+        },
+      });
+    else
+      matchQuery.push({
+        $match: {
+          status: {
+            $gt: 0,
+          },
+        },
+      });
 
-		if (filters) {
-			const filter = {}
+    if (filters) {
+      const filter = {};
 
-			if (req.user.vendorCode) {
-				if (filters.status === "initial") filter.status = 0
-				if (filters.status === "authorized") filter.status = 1
-			} else if (filters.vendorCode) filter.vendorCode = filters.vendorCode
+      if (req.user.vendorCode) {
+        if (filters.status === "initial") filter.status = 0;
+        if (filters.status === "authorized") filter.status = 1;
+      } else if (filters.vendorCode) filter.vendorCode = filters.vendorCode;
 
-			if (filters.quotationNumber) filter.quotationNumber = filters.quotationNumber
-			if (filters.quotationDate?.[0]) {
-				filter.quotationDate = {}
-				if (filters.quotationDate[0])
-					filter.quotationDate["$gte"] = new Date(new Date(filters.quotationDate[0]).setHours(0, 0, 0, 0))
-				if (filters.quotationDate[1])
-					filter.quotationDate["$lte"] = new Date(
-						new Date(filters.quotationDate[1]).setHours(24, 0, 0, 0) - 1
-					)
-			}
-			if (filters.rfqNumber) filter.rfqNumber = filters.rfqNumber
-			if (filters.rfqDate?.[0]) {
-				filter.rfqDate = {}
-				if (filters.rfqDate[0])
-					filter.rfqDate["$gte"] = new Date(new Date(filters.rfqDate[0]).setHours(0, 0, 0, 0))
-				if (filters.rfqDate[1])
-					filter.rfqDate["$lte"] = new Date(new Date(filters.rfqDate[1]).setHours(24, 0, 0, 0) - 1)
-			}
-			if (filters.indentNumber) filter["items.indentNumber"] = filters.indentNumber.trim()
-			if (filters.itemCode) filter["items.itemCode"] = filters.itemCode.trim()
-			if (filters.itemDescription) filter["items.itemDescription"] = filters.itemDescription.trim()
+      if (filters.quotationNumber)
+        filter.quotationNumber = filters.quotationNumber;
+      if (filters.quotationDate?.[0]) {
+        filter.quotationDate = {};
+        if (filters.quotationDate[0])
+          filter.quotationDate["$gte"] = new Date(
+            new Date(filters.quotationDate[0]).setHours(0, 0, 0, 0),
+          );
+        if (filters.quotationDate[1])
+          filter.quotationDate["$lte"] = new Date(
+            new Date(filters.quotationDate[1]).setHours(24, 0, 0, 0) - 1,
+          );
+      }
+      if (filters.rfqNumber) filter.rfqNumber = filters.rfqNumber;
+      if (filters.rfqDate?.[0]) {
+        filter.rfqDate = {};
+        if (filters.rfqDate[0])
+          filter.rfqDate["$gte"] = new Date(
+            new Date(filters.rfqDate[0]).setHours(0, 0, 0, 0),
+          );
+        if (filters.rfqDate[1])
+          filter.rfqDate["$lte"] = new Date(
+            new Date(filters.rfqDate[1]).setHours(24, 0, 0, 0) - 1,
+          );
+      }
+      if (filters.indentNumber)
+        filter["items.indentNumber"] = filters.indentNumber.trim();
+      if (filters.itemCode) filter["items.itemCode"] = filters.itemCode.trim();
+      if (filters.itemDescription)
+        filter["items.itemDescription"] = filters.itemDescription.trim();
 
-			// ✅ NEW: company filter
-			if (filters.company) filter.company = String(filters.company).trim()
+      // ✅ NEW: company filter
+      if (filters.company) filter.company = String(filters.company).trim();
 
-			if (Object.keys(filter).length) matchQuery.push({ $match: filter })
-		}
+      if (Object.keys(filter).length) matchQuery.push({ $match: filter });
+    }
 
-		const response = await dataTable({ ...params, matchQuery }, quotationModel, pipeline)
-		res.status(200).send(response)
-	} catch (error) {
-		next(error)
-	}
-})
+    const response = await dataTable(
+      { ...params, matchQuery },
+      quotationModel,
+      pipeline,
+    );
+    res.status(200).send(response);
+  } catch (error) {
+    next(error);
+  }
+});
 
 quotationRouter.get("/values", authorizeTokens, async (req, res, next) => {
-	try {
-		const { all } = req.query
-		let matchQuery = { status: 1 }
-		if (!all) {
-			const userClinics = (await userModel.findById(req.user._id, { clinics: 1 }))?.clinics
-			matchQuery._id = { $in: userClinics }
-		}
+  try {
+    const { all } = req.query;
+    let matchQuery = { status: 1 };
+    if (!all) {
+      const userClinics = (
+        await userModel.findById(req.user._id, { clinics: 1 })
+      )?.clinics;
+      matchQuery._id = { $in: userClinics };
+    }
 
-		const clinics = await quotationModel.aggregate([
-			{
-				$match: matchQuery
-			},
-			{
-				$project: {
-					value: "$_id",
-					label: "$name"
-				}
-			}
-		])
-		res.status(200).json(clinics)
-	} catch (error) {
-		next(error)
-	}
-})
+    const clinics = await quotationModel.aggregate([
+      {
+        $match: matchQuery,
+      },
+      {
+        $project: {
+          value: "$_id",
+          label: "$name",
+        },
+      },
+    ]);
+    res.status(200).json(clinics);
+  } catch (error) {
+    next(error);
+  }
+});
 
 quotationRouter.get("/items/:id", authorizeTokens, async (req, res, next) => {
-	try {
-		const quotation = req.query.appendRFQDetails
-			? (
-					await quotationModel.aggregate([
-						{
-							$match: {
-								_id: new Types.ObjectId(req.params.id)
-							}
-						},
-						{
-							$unwind: "$items"
-						},
-						{
-							$lookup: {
-								from: "indents",
-								let: { itemCodeVar: "$items.itemCode", indentNumberVar: "$items.indentNumber" },
-								pipeline: [
-									{
-										$match: {
-											$expr: {
-												$and: [
-													{ $eq: ["$itemCode", "$$itemCodeVar"] },
-													{ $eq: ["$indentNumber", "$$indentNumberVar"] }
-												]
-											}
-										}
-									},
-									{
-										$project: {
-											itemDescription: 1,
-											unitOfMeasure: 1
-										}
-									}
-								],
-								as: "indent"
-							}
-						},
-						{
-							$set: {
-								"items.itemDescription": {
-									$first: "$indent.itemDescription"
-								},
-								"items.unit": {
-									$first: "$indent.unitOfMeasure"
-								}
-							}
-						},
-						{
-							$group: {
-								_id: "$_id",
-								items: { $push: "$items" }
-							}
-						}
-					])
-			  )?.[0]
-			: await quotationModel.findById(req.params.id, { items: 1 })
+  try {
+    const quotation = req.query.appendRFQDetails
+      ? (
+          await quotationModel.aggregate([
+            {
+              $match: {
+                _id: new Types.ObjectId(req.params.id),
+              },
+            },
+            {
+              $unwind: "$items",
+            },
+            {
+              $lookup: {
+                from: "indents",
+                let: {
+                  itemCodeVar: "$items.itemCode",
+                  indentNumberVar: "$items.indentNumber",
+                },
+                pipeline: [
+                  {
+                    $match: {
+                      $expr: {
+                        $and: [
+                          { $eq: ["$itemCode", "$$itemCodeVar"] },
+                          { $eq: ["$indentNumber", "$$indentNumberVar"] },
+                        ],
+                      },
+                    },
+                  },
+                  {
+                    $project: {
+                      itemDescription: 1,
+                      unitOfMeasure: 1,
+                    },
+                  },
+                ],
+                as: "indent",
+              },
+            },
+            {
+              $set: {
+                "items.itemDescription": {
+                  $first: "$indent.itemDescription",
+                },
+                "items.unit": {
+                  $first: "$indent.unitOfMeasure",
+                },
+              },
+            },
+            {
+              $group: {
+                _id: "$_id",
+                items: { $push: "$items" },
+              },
+            },
+          ])
+        )?.[0]
+      : await quotationModel.findById(req.params.id, { items: 1 });
 
-		if (!quotation) throw createError("Quotation not found", 404)
+    if (!quotation) throw createError("Quotation not found", 404);
 
-		res.status(200).json(quotation.items)
-	} catch (error) {
-		next(error)
-	}
-})
+    res.status(200).json(quotation.items);
+  } catch (error) {
+    next(error);
+  }
+});
 
-quotationRouter.get("/attachments/:id", authorizeTokens, async (req, res, next) => {
-	try {
-		const rfq = await quotationModel.findById(req.params.id, { attachments: 1 })
-		if (!rfq) throw createError("Quotation not found", 404)
-		res.status(200).json(rfq.attachments)
-	} catch (error) {
-		next(error)
-	}
-})
+quotationRouter.get(
+  "/attachments/:id",
+  authorizeTokens,
+  async (req, res, next) => {
+    try {
+      const rfq = await quotationModel.findById(req.params.id, {
+        attachments: 1,
+      });
+      if (!rfq) throw createError("Quotation not found", 404);
+      res.status(200).json(rfq.attachments);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
-quotationRouter.get("/rfq/:rfqNumber", authorizeTokens, async (req, res, next) => {
-	try {
-		const { rfqNumber } = req.params
-		const rfqs = await quotationModel.findById(rfqNumber)
-		if (!rfqs) throw createError("No quotation found", 404)
-		res.status(200).json(rfqs)
-	} catch (error) {
-		next(error)
-	}
-})
+quotationRouter.get(
+  "/rfq/:rfqNumber",
+  authorizeTokens,
+  async (req, res, next) => {
+    try {
+      const { rfqNumber } = req.params;
+      const rfqs = await quotationModel.findById(rfqNumber);
+      if (!rfqs) throw createError("No quotation found", 404);
+      res.status(200).json(rfqs);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 quotationRouter.get("/", authorizeTokens, async (req, res, next) => {
-	try {
-		const { quotationNumber, fetchNegotiation } = req.query
-		const quotation = (await quotationModel.findOne({ quotationNumber }))?.toJSON()
-		const negotiation = fetchNegotiation ? await negotiationModel.findOne({ quotationNumber }) : null
-		if (!quotation) throw createError("Quotation not found", 404)
+  try {
+    const { quotationNumber, fetchNegotiation } = req.query;
+    const quotation = (
+      await quotationModel.findOne({ quotationNumber })
+    )?.toJSON();
+    const negotiation = fetchNegotiation
+      ? await negotiationModel.findOne({ quotationNumber })
+      : null;
+    if (!quotation) throw createError("Quotation not found", 404);
 
-		const poNumber = await isPoGenerated(quotation)
+    const poNumber = await isPoGenerated(quotation);
 
-		res.status(200).json({ ...quotation, poNumber, negotiation })
-	} catch (error) {
-		next(error)
-	}
-})
+    res.status(200).json({ ...quotation, poNumber, negotiation });
+  } catch (error) {
+    next(error);
+  }
+});
 
 quotationRouter.delete(
-	"/:id",
-	authorizeTokens,
-	authorizePermissions(PERMISSIONS.VENDOR_ACCESS),
-	async (req, res, next) => {
-		try {
-			const quotationVendor = await quotationModel.findById(req.params.id, {
-				vendorCode: 1,
-				status: 1,
-				rfqNumber: 1,
-				vendorCode: 1
-			})
-			if (!quotationVendor) throw createError(`Quotation not found, invalid quotation id.`, 404)
-			if (quotationVendor.vendorCode !== req.user.vendorCode)
-				throw createError("User is not authorized for this action.", 400)
+  "/:id",
+  authorizeTokens,
+  authorizePermissions(PERMISSIONS.VENDOR_ACCESS),
+  async (req, res, next) => {
+    try {
+      const quotationVendor = await quotationModel.findById(req.params.id, {
+        vendorCode: 1,
+        status: 1,
+        rfqNumber: 1,
+        vendorCode: 1,
+      });
+      if (!quotationVendor)
+        throw createError(`Quotation not found, invalid quotation id.`, 404);
+      if (quotationVendor.vendorCode !== req.user.vendorCode)
+        throw createError("User is not authorized for this action.", 400);
 
-			const poNumber = await isPoGenerated(req.params.id)
-			if (poNumber)
-				throw createError(`Cannot delete! Order '${poNumber}' has been generated from this quotation.`, 400)
+      const poNumber = await isPoGenerated(req.params.id);
+      if (poNumber)
+        throw createError(
+          `Cannot delete! Order '${poNumber}' has been generated from this quotation.`,
+          400,
+        );
 
-			await quotationModel.findByIdAndDelete(req.params.id)
+      await quotationModel.findByIdAndDelete(req.params.id);
 
-			if (quotationVendor.status === 1)
-				await rfqModel.findOneAndUpdate(
-					{ rfqNumber: quotationVendor.rfqNumber },
-					{ $set: { "vendors.$[vendor].status": 0 } },
-					{ arrayFilters: [{ "vendor.vendorCode": quotationVendor.vendorCode }] }
-				)
+      if (quotationVendor.status === 1)
+        await rfqModel.findOneAndUpdate(
+          { rfqNumber: quotationVendor.rfqNumber },
+          { $set: { "vendors.$[vendor].status": 0 } },
+          {
+            arrayFilters: [{ "vendor.vendorCode": quotationVendor.vendorCode }],
+          },
+        );
 
-			await fs.rm("uploads/" + req.params.id, { recursive: true, force: true })
-			res.status(200).send({ success: true })
-		} catch (error) {
-			next(error)
-		}
-	}
-)
+      await fs.rm("uploads/" + req.params.id, { recursive: true, force: true });
+      res.status(200).send({ success: true });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
-export default quotationRouter
+export default quotationRouter;

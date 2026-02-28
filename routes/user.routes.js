@@ -823,15 +823,42 @@ userRouter.get("/", async (req, res, next) => {
   }
 });
 
-/**
- * ✅ GET /users/po-vendors (kept)
- */
-userRouter.get("/po-vendors", async (req, res, next) => {
+function norm(v) {
+  return String(v || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+async function getEffectiveCompanyName(userId) {
+  const me = await User.findById(userId, { company: 1, firmId: 1 }).lean();
+
+  const direct =
+    String(me?.company?.name ?? me?.company ?? "").trim();
+
+  if (direct) return direct;
+
+  // ✅ fallback: if user is employee and firm root has company
+  if (me?.firmId) {
+    const firm = await User.findById(me.firmId, { company: 1 }).lean();
+    const firmCompany =
+      String(firm?.company?.name ?? firm?.company ?? "").trim();
+    if (firmCompany) return firmCompany;
+  }
+
+  return "";
+}
+
+userRouter.get("/po-vendors", authorizeTokens, async (req, res, next) => {
   try {
+    // ✅ get roles who can authorize PO
     const roles = await roleModel.find(
       { permissions: { $in: [PERMISSIONS.AUTHORIZE_PO] } },
-      { _id: 1 },
+      { _id: 1 }
     );
+
+    const myCompanyName = await getEffectiveCompanyName(req.user?._id);
+    const myKey = norm(myCompanyName);
+
+    // ✅ if still no company -> return [] (no leakage)
+    if (!myKey) return res.status(200).json([]);
 
     const users = await User.aggregate([
       {
@@ -839,7 +866,81 @@ userRouter.get("/po-vendors", async (req, res, next) => {
           role: { $in: roles.map((i) => i._id) },
         },
       },
-      { $project: { _id: 1, username: 1, name: 1 } },
+
+      // ✅ bring firm root (if user has firmId)
+      {
+        $lookup: {
+          from: "users",
+          localField: "firmId",
+          foreignField: "_id",
+          as: "firmUser",
+        },
+      },
+      {
+        $set: {
+          firmUser: { $first: "$firmUser" },
+        },
+      },
+
+      // ✅ effectiveCompany = user.company.name || user.company || firm.company.name || firm.company
+      {
+        $addFields: {
+          effectiveCompany: {
+            $let: {
+              vars: {
+                cObj: { $ifNull: ["$company.name", ""] },
+                cStr: { $ifNull: ["$company", ""] },
+                fObj: { $ifNull: ["$firmUser.company.name", ""] },
+                fStr: { $ifNull: ["$firmUser.company", ""] },
+              },
+              in: {
+                $cond: [
+                  { $gt: [{ $strLenCP: { $trim: { input: "$$cObj" } } }, 0] },
+                  "$$cObj",
+                  {
+                    $cond: [
+                      { $gt: [{ $strLenCP: { $trim: { input: "$$cStr" } } }, 0] },
+                      "$$cStr",
+                      {
+                        $cond: [
+                          { $gt: [{ $strLenCP: { $trim: { input: "$$fObj" } } }, 0] },
+                          "$$fObj",
+                          "$$fStr",
+                        ],
+                      },
+                    ],
+                  },
+                ],
+              },
+            },
+          },
+        },
+      },
+
+      // ✅ normalize and match company
+      {
+        $addFields: {
+          effectiveCompanyNorm: {
+            $toLower: { $trim: { input: "$effectiveCompany" } },
+          },
+        },
+      },
+      {
+        $match: {
+          $expr: { $eq: ["$effectiveCompanyNorm", myKey] },
+        },
+      },
+
+      // ✅ return
+      {
+        $project: {
+          _id: 1,
+          username: 1,
+          name: 1,
+          company: 1,
+          effectiveCompany: 1,
+        },
+      },
     ]);
 
     res.status(200).json(users);

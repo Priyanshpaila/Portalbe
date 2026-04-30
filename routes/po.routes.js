@@ -185,6 +185,140 @@ poRouter.put("/:id", upload.array("file"), async (req, res, next) => {
   }
 });
 
+poRouter.get("/all", async (req, res, next) => {
+  try {
+    const {
+      page = 1,
+      pageSize = 20,
+      poNumber,
+      sapPONumber,
+      vendorCode,
+      status,
+      refDocumentType,
+      fromDate,
+      toDate,
+      poAmountFrom,
+      poAmountTo,
+      indentNumber,
+      itemCode,
+      itemDescription,
+    } = req.query;
+
+    const filter = {};
+
+    if (req.user?.vendorCode) {
+      filter.vendorCode = req.user.vendorCode;
+
+      filter.$expr = {
+        $and: [
+          { $gt: [{ $size: "$authorize" }, 0] },
+          {
+            $eq: [
+              { $size: "$authorize" },
+              {
+                $size: {
+                  $filter: {
+                    input: "$authorize",
+                    as: "auth",
+                    cond: { $eq: ["$$auth.approvalStatus", 1] },
+                  },
+                },
+              },
+            ],
+          },
+        ],
+      };
+    } else {
+      if (vendorCode) filter.vendorCode = String(vendorCode).trim();
+
+      if (status === "initial") {
+        filter.authorize = {
+          $elemMatch: {
+            $or: [{ approvalStatus: 0 }, { approvalStatus: 2 }],
+          },
+        };
+      }
+
+      if (status === "authorized") {
+        filter.$expr = {
+          $and: [
+            { $gt: [{ $size: "$authorize" }, 0] },
+            {
+              $eq: [
+                { $size: "$authorize" },
+                {
+                  $size: {
+                    $filter: {
+                      input: "$authorize",
+                      as: "auth",
+                      cond: { $eq: ["$$auth.approvalStatus", 1] },
+                    },
+                  },
+                },
+              ],
+            },
+          ],
+        };
+      }
+    }
+
+    if (poNumber) filter.poNumber = String(poNumber).trim();
+    if (sapPONumber) filter.sapPONumber = String(sapPONumber).trim();
+    if (refDocumentType) filter.refDocumentType = String(refDocumentType).trim();
+
+    if (fromDate || toDate) {
+      filter.poDate = {};
+
+      if (fromDate) {
+        filter.poDate.$gte = new Date(new Date(fromDate).setHours(0, 0, 0, 0));
+      }
+
+      if (toDate) {
+        filter.poDate.$lte = new Date(new Date(toDate).setHours(23, 59, 59, 999));
+      }
+    }
+
+    if (poAmountFrom || poAmountTo) {
+      filter["amount.total"] = {};
+
+      if (poAmountFrom) filter["amount.total"].$gte = Number(poAmountFrom);
+      if (poAmountTo) filter["amount.total"].$lte = Number(poAmountTo);
+    }
+
+    if (indentNumber) filter["items.indentNumber"] = String(indentNumber).trim();
+    if (itemCode) filter["items.itemCode"] = String(itemCode).trim();
+    if (itemDescription) {
+      filter["items.itemDescription"] = {
+        $regex: String(itemDescription).trim(),
+        $options: "i",
+      };
+    }
+
+    const skip = (Number(page) - 1) * Number(pageSize);
+
+    const [data, total] = await Promise.all([
+      poModel
+        .find(filter)
+        .sort({ _id: -1 })
+        .skip(skip)
+        .limit(Number(pageSize))
+        .lean(),
+
+      poModel.countDocuments(filter),
+    ]);
+
+    res.status(200).json({
+      data,
+      total,
+      page: Number(page),
+      pageSize: Number(pageSize),
+      totalPages: Math.ceil(total / Number(pageSize)),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 poRouter.get("/poNumber", async (req, res, next) => {
   try {
     const count = await poModel.countDocuments();

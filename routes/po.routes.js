@@ -526,47 +526,162 @@ poRouter.get("/", async (req, res, next) => {
   }
 });
 
-poRouter.get("/pending-po-approvals", async (req, res, next) => {
+poRouter.get("/pending-po-approvals", authorizePermissions(PERMISSIONS.AUTHORIZE_PO), async (req, res, next) => {
   try {
-    const loggedInUserId = new Types.ObjectId(req.user._id?.toString());
+    const userId = req.user?._id || req.user?.id;
 
-    const po = await poModel.aggregate([
+    if (!userId || !Types.ObjectId.isValid(userId)) {
+      throw createError("Invalid logged in user.", 401);
+    }
+
+    const loggedInUserId = new Types.ObjectId(userId.toString());
+
+    const page = Math.max(Number(req.query.page || 1), 1);
+    const pageSize = Math.max(Number(req.query.pageSize || 20), 1);
+    const skip = (page - 1) * pageSize;
+
+    const result = await poModel.aggregate([
       {
         $match: {
+          readyForAuthorization: true,
           authorize: {
-            $elemMatch: { user: loggedInUserId, approvalStatus: 0 },
+            $elemMatch: {
+              user: loggedInUserId,
+              approvalStatus: 0,
+            },
           },
         },
       },
       {
         $addFields: {
-          nextApprover: {
+          currentPendingApprover: {
             $first: {
               $filter: {
                 input: "$authorize",
                 as: "auth",
-                cond: { $eq: ["$$auth.approvalStatus", 0] },
+                cond: {
+                  $eq: ["$$auth.approvalStatus", 0],
+                },
               },
             },
           },
         },
       },
-      { $match: { "nextApprover.user": loggedInUserId } },
       {
-        $project: {
-          poNumber: 1,
-          poDate: 1,
-          sapPONumber: 1,
-          company: 1,
-          itemDescription: "$items.itemDescription",
-          amount: "$amount.total",
-          vendorCode: 1,
-          vendorName: 1,
+        $match: {
+          "currentPendingApprover.user": loggedInUserId,
+          "currentPendingApprover.approvalStatus": 0,
+        },
+      },
+      {
+        $lookup: {
+          from: "users",
+          localField: "currentPendingApprover.user",
+          foreignField: "_id",
+          as: "currentApproverUser",
+        },
+      },
+      {
+        $set: {
+          currentApproverName: {
+            $first: "$currentApproverUser.name",
+          },
+          itemCount: {
+            $size: {
+              $ifNull: ["$items", []],
+            },
+          },
+          itemDescriptions: {
+            $map: {
+              input: {
+                $ifNull: ["$items", []],
+              },
+              as: "item",
+              in: "$$item.itemDescription",
+            },
+          },
+          itemCodes: {
+            $map: {
+              input: {
+                $ifNull: ["$items", []],
+              },
+              as: "item",
+              in: "$$item.itemCode",
+            },
+          },
+        },
+      },
+      {
+        $unset: "currentApproverUser",
+      },
+      {
+        $sort: {
+          "currentPendingApprover.assignOn": 1,
+          _id: -1,
+        },
+      },
+      {
+        $facet: {
+          data: [
+            {
+              $skip: skip,
+            },
+            {
+              $limit: pageSize,
+            },
+            {
+              $project: {
+                _id: 1,
+                poNumber: 1,
+                poDate: 1,
+                sapPONumber: 1,
+                company: 1,
+                division: 1,
+                purchaseType: 1,
+                refDocumentType: 1,
+                refDocumentNumber: 1,
+                refCSNumber: 1,
+                refCSDate: 1,
+                vendorCode: 1,
+                vendorName: 1,
+                vendorLocation: 1,
+                validityDate: 1,
+                departmentName: 1,
+                remarks: 1,
+                amount: "$amount.total",
+                itemCount: 1,
+                itemDescriptions: 1,
+                itemCodes: 1,
+                currentApproval: {
+                  user: "$currentPendingApprover.user",
+                  name: "$currentApproverName",
+                  assignOn: "$currentPendingApprover.assignOn",
+                  approvalStatus: "$currentPendingApprover.approvalStatus",
+                  comment: "$currentPendingApprover.comment",
+                },
+                createdAt: 1,
+              },
+            },
+          ],
+          total: [
+            {
+              $count: "count",
+            },
+          ],
         },
       },
     ]);
 
-    res.status(200).send(po);
+    const data = result?.[0]?.data || [];
+    const total = result?.[0]?.total?.[0]?.count || 0;
+
+    res.status(200).json({
+      data,
+      total,
+      page,
+      pageSize,
+      totalPages: Math.ceil(total / pageSize),
+    });
   } catch (error) {
     next(error);
   }

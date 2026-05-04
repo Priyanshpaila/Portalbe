@@ -654,67 +654,116 @@ userRouter.post(
   async (req, res, next) => {
     try {
       const body = req.body || {};
-      const { username, password, name, role, permissions, ...rest } = body;
+
+      const {
+        username,
+        password,
+        name,
+        role,
+        permissions,
+
+        company,
+        companyName,
+        firmName,
+        industry,
+        gstin,
+        pan,
+        phone,
+        website,
+        addressLine1,
+        addressLine2,
+        city,
+        state,
+        pincode,
+
+        vendorCode: bodyVendorCode,
+        firmId: bodyFirmId,
+
+        ...rest
+      } = body;
 
       if (!username || !password || !name) {
         throw createError("username, password, name are required", 400);
       }
 
-      const companyObj = safeJsonParse(body.company, null) || {
-        name: body.companyName || body.firmName || "",
-        industry: body.industry || "",
-        gstin: body.gstin || "",
-        pan: body.pan || "",
-        phone: body.phone || "",
-        website: body.website || "",
-        addressLine1: body.addressLine1 || "",
-        addressLine2: body.addressLine2 || "",
-        city: body.city || "",
-        state: body.state || "",
-        pincode: body.pincode || "",
+      const parsedCompany =
+        typeof company === "string"
+          ? safeJsonParse(company, null)
+          : company && typeof company === "object"
+            ? company
+            : null;
+
+      const companyObj = {
+        name: String(
+          parsedCompany?.name ||
+            companyName ||
+            firmName ||
+            name ||
+            ""
+        ).trim(),
+
+        industry: String(parsedCompany?.industry || industry || "").trim(),
+        gstin: String(parsedCompany?.gstin || gstin || "").trim(),
+        pan: String(parsedCompany?.pan || pan || "").trim(),
+        phone: String(parsedCompany?.phone || phone || "").trim(),
+        website: String(parsedCompany?.website || website || "").trim(),
+        addressLine1: String(
+          parsedCompany?.addressLine1 || addressLine1 || ""
+        ).trim(),
+        addressLine2: String(
+          parsedCompany?.addressLine2 || addressLine2 || ""
+        ).trim(),
+        city: String(parsedCompany?.city || city || "").trim(),
+        state: String(parsedCompany?.state || state || "").trim(),
+        pincode: String(parsedCompany?.pincode || pincode || "").trim(),
       };
 
-      const vendorCode = body.vendorCode
-        ? String(body.vendorCode).trim()
-        : null;
-      const firmId = oid(body.firmId);
-
-      if (!vendorCode && !firmId && !companyObj?.name) {
-        companyObj.name = String(name || "").trim();
+      if (!companyObj.name) {
+        throw createError("company.name is required", 400);
       }
 
-      if (req.file) rest.digitalSignature = req.file.filename;
+      const vendorCode = bodyVendorCode
+        ? String(bodyVendorCode).trim()
+        : null;
+
+      const firmId = oid(bodyFirmId);
+
+      if (req.file) {
+        rest.digitalSignature = req.file.filename;
+      }
 
       const hashedPassword = await hashAsync(password, 10);
 
       const newUser = new User({
         _id: req.params.id,
+
+        ...rest,
+
         username: String(username).trim(),
         password: hashedPassword,
         passwordStatus: "temporary",
         createdBy: req?.user?._id,
         name: String(name).trim(),
+
         permissions,
         role: role || null,
 
-        vendorCode: vendorCode || null,
-        firmId: firmId || null,
+        vendorCode,
+        firmId,
         company: companyObj,
-
-        ...rest,
       });
 
       await newUser.save();
 
       const json = newUser.toJSON();
       delete json.password;
+
       res.status(201).json(json);
     } catch (error) {
       next(error);
     }
-  },
+  }
 );
-
 /**
  * ✅ POST /users/list (datatable)
  */

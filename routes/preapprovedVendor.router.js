@@ -7,6 +7,9 @@ import counterModel from "../models/counter.model.js";
 import roleModel from "../models/role.model.js";
 import { PERMISSIONS } from "../lib/permissions.js";
 
+import { sendMail } from "../lib/nodemailer.js"
+import generateEmailBody from "../helpers/generateEmailBody.js"
+
 const preapprovedVendorRouter = express.Router();
 
 /** =========================
@@ -305,7 +308,7 @@ preapprovedVendorRouter.put("/:id", async (req, res, next) => {
   }
 });
 
-// ✅ Approve: create vendor USER correctly (map -> vendorProfile)
+// ✅ Approve: create vendor USER correctly (map -> vendorProfile) + send credentials email
 preapprovedVendorRouter.post("/:id/approve", async (req, res, next) => {
   try {
     const id = req.params.id;
@@ -335,13 +338,11 @@ preapprovedVendorRouter.post("/:id/approve", async (req, res, next) => {
       });
     }
 
-    // Ensure companyCode exists on preapproved record
     if (!normStr(pre.companyCode)) {
       pre.companyCode = await nextCompanyCode();
       await pre.save();
     }
 
-    // Extract primary contact email
     const contactEmail =
       Array.isArray(pre.contactPerson) && pre.contactPerson.length > 0
         ? toLowerEmail(pre.contactPerson[0]?.email)
@@ -356,37 +357,30 @@ preapprovedVendorRouter.post("/:id/approve", async (req, res, next) => {
         const username = vendorCode;
         const passwordHash = await bcrypt.hash(vendorCode, 10);
 
-        // ✅ build vendorProfile from preapproved fields
         const vendorProfile = buildVendorProfileFromPreapproved(pre, vendorCode);
 
         createdVendorUser = await userModel.create({
-          // identity flags
           vendorCode,
           firmId: null,
 
-          // role
           role: vendorRole._id,
 
-          // login
           username,
           password: passwordHash,
           passwordStatus: "temporary",
 
-          // required fields
           name: normStr(pre.name) || vendorCode,
           email: contactEmail || "",
 
-          // ✅ IMPORTANT: put preapproved fields inside vendorProfile
           vendorProfile,
 
-          // system
           createdBy: req?.user?._id || req?.user?.id || null,
           status: 1,
         });
 
         break;
       } catch (e) {
-        if (e?.code === 11000) continue; // retry vendorCode/username collision
+        if (e?.code === 11000) continue;
         throw e;
       }
     }
@@ -394,18 +388,44 @@ preapprovedVendorRouter.post("/:id/approve", async (req, res, next) => {
     if (!createdVendorUser) {
       return res.status(500).send({
         success: false,
-        message:
-          "Failed to create vendor user with unique vendorCode/username",
+        message: "Failed to create vendor user with unique vendorCode/username",
       });
     }
 
     pre.status = "approved";
     await pre.save();
 
+    let emailSent = false;
+    let emailError = null;
+
+    if (contactEmail) {
+      try {
+        await sendMail({
+          to: contactEmail,
+          subject: "Vendor Portal Login Credentials",
+          text: generateEmailBody.vendorCredentials(
+            createdVendorUser.username,
+            createdVendorUser._id
+          ),
+        });
+
+        emailSent = true;
+      } catch (mailErr) {
+        emailError = mailErr?.message || "Failed to send credentials email";
+        console.error("Vendor credentials email failed:", mailErr);
+      }
+    } else {
+      emailError = "Vendor contact email not found";
+    }
+
     return res.status(200).send({
       success: true,
-      message: "Vendor approved and created in users collection",
+      message: emailSent
+        ? "Vendor approved, created in users collection, and credentials email sent"
+        : "Vendor approved and created in users collection, but credentials email was not sent",
       vendorUser: createdVendorUser,
+      emailSent,
+      emailError,
       credentials: {
         username: createdVendorUser.username,
         password: createdVendorUser.vendorCode,

@@ -10,7 +10,7 @@ const roleRouter = express.Router()
 // GET all roles + permissions list
 roleRouter.get("/", auth, async (req, res, next) => {
 	try {
-		const roles = await Role.find({ status: 1, hidden: { $ne: true } }).populate("createdBy", "name")
+		const roles = await Role.find({  hidden: { $ne: true } }).populate("createdBy", "name")
 		res.status(200).json({
 			roles,
 			data: {

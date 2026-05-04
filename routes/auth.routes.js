@@ -1,46 +1,60 @@
-import express from "express"
-import jwt from "jsonwebtoken"
-import userModel from "../models/user.model.js"
-import { createError } from "../lib/customError.js"
-import roleModel from "../models/role.model.js"
-import { compareAsync } from "../helpers/hash.js"
+import express from "express";
+import jwt from "jsonwebtoken";
+import userModel from "../models/user.model.js";
+import { createError } from "../lib/customError.js";
+import roleModel from "../models/role.model.js";
+import { compareAsync } from "../helpers/hash.js";
 
-const authRouter = express.Router()
+const authRouter = express.Router();
 
 authRouter.post("/login", async (req, res, next) => {
-  const { username, password, id } = req.body
+  const { username, password, id } = req.body;
 
   try {
-    // ✅ fetch user (firmId included if you added it in schema)
-    const user = id
-      ? (await userModel.findById(id))?.toJSON()
-      : (await userModel.findOne({ username }))?.toJSON()
+    const userDoc = id
+      ? await userModel.findById(id)
+      : await userModel.findOne({ username });
 
-    if (!user || (!id && !password)) throw createError("Invalid username or password", 401)
+    const user = userDoc?.toJSON();
 
-    if (password) {
-      const isMatch = await compareAsync(password, user.password)
-      if (!isMatch) throw createError("Invalid username or password", 401)
+    if (!user || (!id && !password)) {
+      throw createError("Invalid username or password", 401);
     }
 
-    const role = await roleModel.findById(user.role, { permissions: 1, name: 1 })
-    if (!role) throw createError("User assigned invalid role", 401)
+    if (Number(user.status) === 0) {
+      throw createError("Your account is inactive. Please contact administrator.", 403);
+    }
 
-    // ✅ add firmId + roleName in token (safe string)
+    if (password) {
+      const isMatch = await compareAsync(password, user.password);
+      if (!isMatch) {
+        throw createError("Invalid username or password", 401);
+      }
+    }
+
+    const role = await roleModel.findById(user.role, {
+      permissions: 1,
+      name: 1,
+    });
+
+    if (!role) {
+      throw createError("User assigned invalid role", 401);
+    }
+
     const token = jwt.sign(
       {
         userId: user._id,
         vendorCode: user.vendorCode,
-        firmId: user.firmId ? String(user.firmId) : null, // ✅ NEW
-        roleName: role.name, // ✅ NEW (useful for bypassRoles)
+        firmId: user.firmId ? String(user.firmId) : null,
+        roleName: role.name,
         permissions: role.permissions,
       },
       process.env.JWT_SECRET,
       { expiresIn: "12h" }
-    )
+    );
 
-    delete user._id
-    delete user.password
+    delete user._id;
+    delete user.password;
 
     res.json({
       token,
@@ -49,10 +63,10 @@ authRouter.post("/login", async (req, res, next) => {
         permissions: role.permissions,
       },
       role: role.name,
-    })
+    });
   } catch (error) {
-    next(error)
+    next(error);
   }
-})
+});
 
-export default authRouter
+export default authRouter;

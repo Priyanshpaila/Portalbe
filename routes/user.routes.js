@@ -1017,6 +1017,7 @@ userRouter.put(
         const currData = await User.findById(req.params.id, {
           digitalSignature: 1,
         });
+
         if (currData?.digitalSignature) {
           await fs.rm(`uploads/${req.params.id}/${currData.digitalSignature}`, {
             force: true,
@@ -1033,27 +1034,47 @@ userRouter.put(
         if (v !== undefined) updatedData[k] = v;
       };
 
+      const parseStatus = (value) => {
+        if (value === undefined) return undefined;
+
+        const statusNumber = Number(value);
+
+        if (![0, 1].includes(statusNumber)) {
+          throw createError("status must be 0 or 1", 400);
+        }
+
+        return statusNumber;
+      };
+
       setIf(
         "username",
         body.username ? String(body.username).trim() : undefined,
       );
+
       setIf("name", body.name ? String(body.name).trim() : undefined);
+
       setIf(
         "vendorCode",
         body.vendorCode !== undefined
           ? String(body.vendorCode).trim() || null
           : undefined,
       );
+
       setIf(
         "email",
         body.email !== undefined ? String(body.email).trim() : undefined,
       );
+
       setIf("role", body.role !== undefined ? body.role : undefined);
+
       setIf(
         "digitalSignature",
         digitalSignature !== undefined ? digitalSignature : undefined,
       );
+
       setIf("firmId", body.firmId !== undefined ? firmId : undefined);
+
+      setIf("status", parseStatus(body.status));
 
       if (companyObj) {
         updatedData.company = {
@@ -1073,6 +1094,7 @@ userRouter.put(
           state: body.state,
           pincode: body.pincode,
         };
+
         const any = Object.values(flatCompany).some((x) => x !== undefined);
         if (any) updatedData.company = flatCompany;
       }
@@ -1080,12 +1102,17 @@ userRouter.put(
       const user = await User.findByIdAndUpdate(
         req.params.id,
         { $set: updatedData },
-        { new: true },
+        {
+          new: true,
+          runValidators: true,
+        },
       );
+
       if (!user) throw createError("User not found", 404);
 
       const json = user.toJSON();
       delete json.password;
+
       res.status(200).json(json);
     } catch (error) {
       next(error);

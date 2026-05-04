@@ -8,6 +8,11 @@ import counterModel from "../models/counter.model.js";
 import vendorFirmLinkModel from "../models/vendorFirmLink.model.js";
 import { importVendors } from "../lib/importVendors.js";
 import { authorizeTokens } from "../middlewares/auth.middleware.js";
+import roleModel from "../models/role.model.js";
+import { PERMISSIONS } from "../lib/permissions.js";
+
+import { sendMail } from "../lib/nodemailer.js";
+import generateEmailBody from "../helpers/generateEmailBody.js";
 
 const vendorRouter = express.Router();
 
@@ -24,14 +29,16 @@ function getUserObjectId(req) {
   const raw = req?.user?._id || req?.user?.id || req?.user?.userId;
   if (!raw) return null;
   if (raw instanceof mongoose.Types.ObjectId) return raw;
-  if (mongoose.isValidObjectId(String(raw))) return new mongoose.Types.ObjectId(String(raw));
+  if (mongoose.isValidObjectId(String(raw)))
+    return new mongoose.Types.ObjectId(String(raw));
   return null;
 }
 
 function toObjectIdMaybe(v) {
   if (!v) return null;
   if (v instanceof mongoose.Types.ObjectId) return v;
-  if (mongoose.isValidObjectId(String(v))) return new mongoose.Types.ObjectId(String(v));
+  if (mongoose.isValidObjectId(String(v)))
+    return new mongoose.Types.ObjectId(String(v));
   return null;
 }
 
@@ -44,7 +51,9 @@ function isPlatformAdminUser(me) {
   if (!me) return false;
   if (me.isSuperAdmin === true || me.isPlatformAdmin === true) return true;
   const role = String(me.role || me.userType || me.type || "").toLowerCase();
-  return ["superadmin", "platform_admin", "root_admin", "owner_admin"].includes(role);
+  return ["superadmin", "platform_admin", "root_admin", "owner_admin"].includes(
+    role,
+  );
 }
 
 /**
@@ -208,7 +217,7 @@ async function ensureVendorCounterInitialized() {
         $setOnInsert: { _id: COUNTER_ID },
         $max: { seq: maxSeq },
       },
-      { upsert: true, new: true }
+      { upsert: true, new: true },
     );
   })();
 
@@ -221,7 +230,7 @@ async function nextVendorCode() {
   const counter = await counterModel.findByIdAndUpdate(
     COUNTER_ID,
     { $inc: { seq: 1 } },
-    { new: true, upsert: true }
+    { new: true, upsert: true },
   );
 
   const seq = counter?.seq || 1;
@@ -258,7 +267,8 @@ vendorRouter.get("/list", async (req, res, next) => {
     const { vendorCode, search } = req.query;
 
     const ctx = await buildVendorScopeFilter(req);
-    if (ctx.unauthorized) return res.status(401).send({ message: "Unauthorized" });
+    if (ctx.unauthorized)
+      return res.status(401).send({ message: "Unauthorized" });
 
     const match = ctx.match;
 
@@ -267,7 +277,11 @@ vendorRouter.get("/list", async (req, res, next) => {
       const code = String(vendorCode).trim();
       const vFilter = match.vendorCode;
 
-      if (typeof vFilter === "object" && vFilter?.$in && !vFilter.$in.includes(code)) {
+      if (
+        typeof vFilter === "object" &&
+        vFilter?.$in &&
+        !vFilter.$in.includes(code)
+      ) {
         return res.status(403).send({ message: "Not allowed" });
       }
 
@@ -298,12 +312,15 @@ vendorRouter.get("/list", async (req, res, next) => {
 vendorRouter.get("/basic-details", async (req, res, next) => {
   try {
     const ctx = await buildVendorScopeFilter(req);
-    if (ctx.unauthorized) return res.status(401).send({ message: "Unauthorized" });
+    if (ctx.unauthorized)
+      return res.status(401).send({ message: "Unauthorized" });
 
-    const data = await userModel.find(
-      ctx.match,
-      { vendorCode: 1, name: 1, contactPerson: 1, street: 1 }
-    );
+    const data = await userModel.find(ctx.match, {
+      vendorCode: 1,
+      name: 1,
+      contactPerson: 1,
+      street: 1,
+    });
 
     res.status(200).send(data);
   } catch (error) {
@@ -322,7 +339,8 @@ vendorRouter.get("/values", async (req, res, next) => {
     const { search } = req.query;
 
     const ctx = await buildVendorScopeFilter(req);
-    if (ctx.unauthorized) return res.status(401).send({ message: "Unauthorized" });
+    if (ctx.unauthorized)
+      return res.status(401).send({ message: "Unauthorized" });
 
     const match = ctx.match;
 
@@ -341,7 +359,7 @@ vendorRouter.get("/values", async (req, res, next) => {
       data.map((i) => ({
         label: i.name,
         value: i.vendorCode,
-      }))
+      })),
     );
   } catch (error) {
     next(error);
@@ -354,20 +372,103 @@ vendorRouter.get("/values", async (req, res, next) => {
  * - username = vendorCode
  * - password = vendorCode (stored hashed)
  */
+// vendorRouter.post("/", async (req, res, next) => {
+//   try {
+//     const payload = req.body || {};
+
+//     const name = String(payload.name || "").trim();
+//     if (!name) {
+//       return res.status(400).send({ success: false, message: "name is required." });
+//     }
+
+//     const contactPerson = Array.isArray(payload.contactPerson) ? payload.contactPerson : [];
+
+//     const email =
+//       String(payload.email || "").trim().toLowerCase() ||
+//       String(contactPerson?.[0]?.email || "").trim().toLowerCase() ||
+//       "";
+
+//     let created = null;
+
+//     for (let attempt = 0; attempt < 5; attempt++) {
+//       const vendorCode = await nextVendorCode();
+
+//       try {
+//         const username = vendorCode;
+//         const passwordHash = await bcrypt.hash(vendorCode, 10);
+
+//         created = await userModel.create({
+//           ...payload,
+
+//           vendorCode,
+//           firmId: null,
+
+//           username,
+//           password: passwordHash,
+//           passwordStatus: "permanent",
+
+//           name,
+//           email,
+//           contactPerson,
+
+//           createdBy: req?.user?._id || req?.user?.id || null,
+//           status: 1,
+//         });
+
+//         break;
+//       } catch (e) {
+//         if (e?.code === 11000) continue;
+//         throw e;
+//       }
+//     }
+
+//     if (!created) {
+//       return res.status(500).send({
+//         success: false,
+//         message: "Unable to generate unique vendorCode. Please try again.",
+//       });
+//     }
+
+//     res.status(201).send({ success: true, data: created });
+//   } catch (error) {
+//     next(error);
+//   }
+// });
+
+/**
+ * ✅ POST /vendor (auto vendorCode)
+ * - creates vendor USER
+ * - username = vendorCode
+ * - password = vendorCode (stored hashed)
+ * - sends credentials email to vendor
+ */
 vendorRouter.post("/", async (req, res, next) => {
   try {
     const payload = req.body || {};
+    const vendorRole = await roleModel.findOne(
+      { permissions: { $in: [PERMISSIONS.VENDOR_ACCESS] }, status: 1 },
+      { _id: 1 },
+    );
 
     const name = String(payload.name || "").trim();
     if (!name) {
-      return res.status(400).send({ success: false, message: "name is required." });
+      return res.status(400).send({
+        success: false,
+        message: "name is required.",
+      });
     }
 
-    const contactPerson = Array.isArray(payload.contactPerson) ? payload.contactPerson : [];
+    const contactPerson = Array.isArray(payload.contactPerson)
+      ? payload.contactPerson
+      : [];
 
     const email =
-      String(payload.email || "").trim().toLowerCase() ||
-      String(contactPerson?.[0]?.email || "").trim().toLowerCase() ||
+      String(payload.email || "")
+        .trim()
+        .toLowerCase() ||
+      String(contactPerson?.[0]?.email || "")
+        .trim()
+        .toLowerCase() ||
       "";
 
     let created = null;
@@ -384,6 +485,7 @@ vendorRouter.post("/", async (req, res, next) => {
 
           vendorCode,
           firmId: null,
+          role: vendorRole._id,
 
           username,
           password: passwordHash,
@@ -411,75 +513,52 @@ vendorRouter.post("/", async (req, res, next) => {
       });
     }
 
-    res.status(201).send({ success: true, data: created });
-  } catch (error) {
-    next(error);
-  }
-});
+    let emailSent = false;
+    let emailError = null;
 
-/**
- * ✅ PUT /vendor/:vendorCode (update)
- * - vendor can update only self
- * - firm users cannot update vendor via this endpoint (unless platform admin)
- */
-vendorRouter.put("/:vendorCode", async (req, res, next) => {
-  try {
-    const vendorCode = String(req.params.vendorCode || "").trim();
-    if (!vendorCode) {
-      return res.status(400).send({
-        success: false,
-        message: "vendorCode param is required.",
-      });
+    if (email) {
+      try {
+        const mailResult = await sendMail([
+          {
+            to: email,
+            subject: "Vendor Portal Login Credentials",
+            text: generateEmailBody.vendorCredentials(
+              created.username,
+              created._id,
+            ),
+          },
+        ]);
+
+        emailSent = mailResult.ok;
+
+        if (!mailResult.ok) {
+          emailError =
+            mailResult.results?.[0]?.error ||
+            "Failed to send vendor credentials email";
+        }
+      } catch (mailErr) {
+        emailError =
+          mailErr?.message || "Failed to send vendor credentials email";
+        console.error("Vendor credentials email failed:", mailErr);
+      }
+    } else {
+      emailError = "Vendor email not found";
     }
 
-    const { me, isVendor, isPlatformAdmin } = await getMe(req);
-    if (!me) return res.status(401).send({ message: "Unauthorized" });
-
-    if (isVendor && String(me.vendorCode || "").trim() !== vendorCode) {
-      return res.status(403).send({ success: false, message: "Not allowed." });
-    }
-
-    if (!isVendor && !isPlatformAdmin) {
-      return res.status(403).send({ success: false, message: "Not allowed." });
-    }
-
-    const payload = req.body || {};
-
-    if (payload.vendorCode && String(payload.vendorCode).trim() !== vendorCode) {
-      return res.status(400).send({
-        success: false,
-        message: "vendorCode cannot be changed.",
-      });
-    }
-
-    if (payload.username && String(payload.username).trim() !== vendorCode) {
-      return res.status(400).send({
-        success: false,
-        message: "username cannot be changed for vendor accounts.",
-      });
-    }
-
-    if (payload.firmId) delete payload.firmId;
-    if (payload.password) delete payload.password;
-
-    if (payload.contactPerson && !Array.isArray(payload.contactPerson)) {
-      return res.status(400).send({
-        success: false,
-        message: "contactPerson must be an array.",
-      });
-    }
-
-    const updated = await userModel.findOneAndUpdate(
-      { vendorCode, vendorCode: { $exists: true, $nin: [null, ""] } },
-      { $set: payload },
-      { new: true, runValidators: true }
-    );
-
-    if (!updated) {
-      return res.status(404).send({ success: false, message: "Vendor not found." });
-    }
-
-    res.status(200).send({ success: true, data: updated });
+    res.status(201).send({
+      success: true,
+      message: emailSent
+        ? "Vendor created and credentials email sent"
+        : "Vendor created but credentials email was not sent",
+      data: created,
+      emailSent,
+      emailError,
+      credentials: {
+        username: created.username,
+        password: created.vendorCode,
+        vendorCode: created.vendorCode,
+      },
+    });
   } catch (error) {
     next(error);
   }

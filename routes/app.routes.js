@@ -4,6 +4,7 @@ import rfqModel from "../models/rfq.model.js";
 import quotationModel from "../models/quotation.model.js";
 import indentModel from "../models/indent.model.js";
 import poModel from "../models/po.model.js";
+import userModel from "../models/user.model.js";
 
 const appRouter = express.Router();
 
@@ -24,7 +25,64 @@ const authorizedPOQuery = {
   },
 };
 
-const getStats = async (userId) => {
+const normalizeText = (value) =>
+  String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "");
+
+const isSuperAdminUser = (user) => {
+  const role = user?.role || {};
+  const roleName =
+    role?.name ||
+    role?.roleName ||
+    role?.label ||
+    role?.code ||
+    user?.roleName ||
+    user?.userType ||
+    "";
+
+  const normalizedRole = normalizeText(roleName);
+  const normalizedUsername = normalizeText(user?.username);
+
+  return (
+    user?.isSuperAdmin === true ||
+    ["superadmin", "superadministrator"].includes(normalizedRole) ||
+    ["superadmin", "superadministrator"].includes(normalizedUsername)
+  );
+};
+
+const getRequestUserScope = async (req) => {
+  const userId = req.user?._id || req.user?.id;
+
+  const dbUser =
+    userId && Types.ObjectId.isValid(userId)
+      ? await userModel.findById(userId).populate("role").lean()
+      : null;
+
+  const user = dbUser || req.user || {};
+
+  const vendorCode = user?.vendorCode || req.user?.vendorCode || null;
+  const companyName = String(user?.company?.name || req.user?.company?.name || "").trim();
+  const isSuperAdmin = isSuperAdminUser(user);
+
+  const companyFilter =
+    !vendorCode && !isSuperAdmin
+      ? { company: companyName || "__NO_COMPANY__" }
+      : {};
+
+  return {
+    userId,
+    vendorCode,
+    companyName,
+    isSuperAdmin,
+    companyFilter,
+  };
+};
+
+const hasCompanyFilter = (companyFilter = {}) => Object.keys(companyFilter || {}).length > 0;
+
+const getStats = async (userId, companyFilter = {}) => {
   const expiringIndents = 0;
 
   const userObjectId = Types.ObjectId.isValid(userId)
@@ -37,6 +95,7 @@ const getStats = async (userId) => {
     const result = await poModel.aggregate([
       {
         $match: {
+          ...companyFilter,
           readyForAuthorization: true,
           status: { $ne: 1 },
           authorize: {
@@ -90,19 +149,45 @@ const getStats = async (userId) => {
     totalPOs,
   ] = await Promise.all([
     indentModel.countDocuments({
+      ...companyFilter,
       $expr: { $eq: ["$balanceQty", "$indentQty"] },
     }),
-    rfqModel.countDocuments({ status: 1 }),
-    rfqModel.countDocuments({ status: 0 }),
-    quotationModel.countDocuments({ status: { $gte: 1 } }),
+
+    rfqModel.countDocuments({
+      ...companyFilter,
+      status: 1,
+    }),
+
+    rfqModel.countDocuments({
+      ...companyFilter,
+      status: 0,
+    }),
+
+    quotationModel.countDocuments({
+      ...companyFilter,
+      status: { $gte: 1 },
+    }),
+
     (async () => {
-      return (await rfqModel.find({ status: 1 }, { vendors: 1 }))?.reduce(
-        (sum, i) => sum + i.vendors.filter((v) => v.status === 0).length,
+      return (
+        await rfqModel.find(
+          {
+            ...companyFilter,
+            status: 1,
+          },
+          { vendors: 1 },
+        )
+      )?.reduce(
+        (sum, i) => sum + (i.vendors || []).filter((v) => v.status === 0).length,
         0,
       );
     })(),
+
     getUnapprovedPOsForUser(),
-    poModel.countDocuments({}),
+
+    poModel.countDocuments({
+      ...companyFilter,
+    }),
   ]);
 
   return {
@@ -116,6 +201,7 @@ const getStats = async (userId) => {
     totalPOs,
   };
 };
+
 const getVendorStats = async (vendorCode) => {
   const [pendingRFQs, totalRFQs, totalQuotations, initialQuotations, totalPOs] =
     await Promise.all([
@@ -150,13 +236,13 @@ const getVendorStats = async (vendorCode) => {
   };
 };
 
-const getMonthyTrend = async (vendorCode) => {
+const getMonthyTrend = async (vendorCode, companyFilter = {}) => {
   const monthsCount = 6;
 
   const getPipeline = (matchQuery = [], vendorField) => [
     {
       $match: {
-        ...(vendorCode ? { [vendorField || "vendorCode"]: vendorCode } : {}),
+        ...(vendorCode ? { [vendorField || "vendorCode"]: vendorCode } : companyFilter),
         $expr: {
           $gte: [
             "$createdAt",
@@ -209,8 +295,13 @@ const getMonthyTrend = async (vendorCode) => {
   };
 };
 
-const getTodayVs30Days = async (vendorCode) => {
+const getTodayVs30Days = async (vendorCode, companyFilter = {}) => {
   const getPipeline = (isSum = false, matchPipeline = [], vendorKey) => [
+    {
+      $match: {
+        ...(vendorCode ? {} : companyFilter),
+      },
+    },
     ...matchPipeline,
     ...(vendorCode
       ? [{ $match: { [vendorKey || "vendorCode"]: vendorCode } }]
@@ -290,11 +381,12 @@ const getTodayVs30Days = async (vendorCode) => {
   };
 };
 
-const getAmountTrend = async () => {
+const getAmountTrend = async (companyFilter = {}) => {
   return (
     await poModel.aggregate([
       {
         $match: {
+          ...companyFilter,
           $expr: {
             $gte: [
               "$createdAt",
@@ -397,7 +489,7 @@ const getVendorTablesData = async (vendorCode) => {
           },
         },
         {
-          $sort: { validtyDate: 1 },
+          $sort: { validityDate: 1 },
         },
         {
           $limit: 5,
@@ -467,17 +559,102 @@ const getVendorTablesData = async (vendorCode) => {
   };
 };
 
+const getFirmTablesData = async (companyFilter = {}) => {
+  const companyMatch = hasCompanyFilter(companyFilter) ? [{ $match: companyFilter }] : [];
+
+  const [indents, rfq, quotations, po] = await Promise.all([
+    indentModel.aggregate([
+      ...companyMatch,
+      {
+        $sort: { _id: -1 },
+      },
+      {
+        $limit: 5,
+      },
+      {
+        $project: {
+          company: 1,
+          indentNumber: 1,
+          documentDate: 1,
+          itemDescription: 1,
+          techSpec: 1,
+          indentQty: 1,
+          costCenter: 1,
+          balanceQty: 1,
+        },
+      },
+    ]),
+    rfqModel.aggregate([
+      ...companyMatch,
+      {
+        $sort: { _id: -1 },
+      },
+      {
+        $limit: 5,
+      },
+      {
+        $project: {
+          rfqNumber: 1,
+          rfqDate: 1,
+          itemDescription: "$items.itemDescription",
+        },
+      },
+    ]),
+    quotationModel.aggregate([
+      ...companyMatch,
+      {
+        $sort: { _id: -1 },
+      },
+      {
+        $limit: 5,
+      },
+      {
+        $project: {
+          quotationNumber: 1,
+          rfqNumber: 1,
+          quotationDate: 1,
+          vendorCode: 1,
+        },
+      },
+    ]),
+    poModel.aggregate([
+      ...companyMatch,
+      {
+        $sort: { _id: -1 },
+      },
+      {
+        $limit: 5,
+      },
+      {
+        $project: {
+          poNumber: 1,
+          poDate: 1,
+          company: 1,
+          vendorName: 1,
+          amount: "$amount.total",
+        },
+      },
+    ]),
+  ]);
+
+  return { indents, rfq, quotations, po };
+};
+
 appRouter.get("/stats", async (req, res, next) => {
   try {
-    const vendorCode = req.user.vendorCode;
-    const userId = req.user?._id || req.user?.id;
+    const scope = await getRequestUserScope(req);
 
     const [stats, monthlyTrend, todayVs30Days, amountTrend] = await Promise.all(
       [
-        vendorCode ? getVendorStats(vendorCode) : getStats(userId),
-        getMonthyTrend(vendorCode),
-        getTodayVs30Days(vendorCode),
-        vendorCode ? null : getAmountTrend(),
+        scope.vendorCode
+          ? getVendorStats(scope.vendorCode)
+          : getStats(scope.userId, scope.companyFilter),
+
+        getMonthyTrend(scope.vendorCode, scope.companyFilter),
+
+        getTodayVs30Days(scope.vendorCode, scope.companyFilter),
+
+        scope.vendorCode ? null : getAmountTrend(scope.companyFilter),
       ],
     );
 
@@ -486,6 +663,10 @@ appRouter.get("/stats", async (req, res, next) => {
       monthlyTrend,
       todayVs30Days,
       amountTrend,
+      scope: {
+        isSuperAdmin: scope.isSuperAdmin,
+        company: scope.isSuperAdmin ? "ALL" : scope.companyName,
+      },
     });
   } catch (error) {
     next(error);
@@ -494,81 +675,13 @@ appRouter.get("/stats", async (req, res, next) => {
 
 appRouter.get("/table-data", async (req, res, next) => {
   try {
-    const vendorCode = req.user.vendorCode;
-    if (vendorCode) return res.json(await getVendorTablesData(vendorCode));
+    const scope = await getRequestUserScope(req);
 
-    const [indents, rfq, quotations, po] = await Promise.all([
-      indentModel.aggregate([
-        {
-          $sort: { _id: -1 },
-        },
-        {
-          $limit: 5,
-        },
-        {
-          $project: {
-            company: 1,
-            indentNumber: 1,
-            documentDate: 1,
-            itemDescription: 1,
-            techSpec: 1,
-            indentQty: 1,
-            costCenter: 1,
-            balanceQty: 1,
-          },
-        },
-      ]),
-      rfqModel.aggregate([
-        {
-          $sort: { _id: -1 },
-        },
-        {
-          $limit: 5,
-        },
-        {
-          $project: {
-            rfqNumber: 1,
-            rfqDate: 1,
-            itemDescription: "$items.itemDescription",
-          },
-        },
-      ]),
-      quotationModel.aggregate([
-        {
-          $sort: { _id: -1 },
-        },
-        {
-          $limit: 5,
-        },
-        {
-          $project: {
-            quotationNumber: 1,
-            rfqNumber: 1,
-            quotationDate: 1,
-            vendorCode: 1,
-          },
-        },
-      ]),
-      poModel.aggregate([
-        {
-          $sort: { _id: -1 },
-        },
-        {
-          $limit: 5,
-        },
-        {
-          $project: {
-            poNumber: 1,
-            poDate: 1,
-            company: 1,
-            vendorName: 1,
-            amount: "$amount.total",
-          },
-        },
-      ]),
-    ]);
+    if (scope.vendorCode) {
+      return res.json(await getVendorTablesData(scope.vendorCode));
+    }
 
-    res.json({ indents, rfq, quotations, po });
+    return res.json(await getFirmTablesData(scope.companyFilter));
   } catch (error) {
     next(error);
   }
